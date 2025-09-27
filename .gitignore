@@ -1,0 +1,11 @@
+__pycache__
+data/
+data_tokenized/
+**/__pycache__
+**/.DS_Store
+node_modules/
+**/fastsplit/target
+*.egg-info*
+**/data_tokenized
+wandb/
+checkpoints/
