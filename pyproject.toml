@@ -68,5 +68,6 @@ line-length = 120
 # extend-select = ["UP"]
 select = ["UP"]
 ignore = [
-    "F722"
+    "F722",
+    "UP037"
 ]

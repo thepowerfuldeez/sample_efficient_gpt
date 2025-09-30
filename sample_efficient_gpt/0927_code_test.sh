@@ -1,1 +1,0 @@
-uv run train.py --override '{"model.attn_gating": true, "trainer.save_every": 10000, "optim.warmup_steps": 1500, "optim.muon_lr": 1.7e-2, "optim.muon_wd": 1e-3, "optim.muon_wd_min": 1e-4}' --train-path ../data_code/stack_v2_sample_train.npy --validation-path ../data_code/stack_v2_sample_val.npy
