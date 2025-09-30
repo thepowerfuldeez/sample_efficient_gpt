@@ -131,7 +131,7 @@ class SimpleMBPPEvaluator:
                     )
 
                 results_by_task.setdefault(tid, []).append(
-                    {"task_id": tid, "base_status": base_status, "plus_status": plus_status}
+                    {"task_id": tid, "base_status": base_status, "plus_status": plus_status, "code": code}
                 )
                 totals_by_task[tid] = totals_by_task.get(tid, 0) + 1
                 base_correct_by_task[tid] = base_correct_by_task.get(tid, 0) + (1 if base_status == PASS else 0)

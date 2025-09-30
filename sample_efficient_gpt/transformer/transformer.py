@@ -48,6 +48,7 @@ class Block(nn.Module):
         token_positions: Int[Tensor, "b seq"] | None = None,
         v1: Tensor | None = None,
     ) -> Float[Tensor, "b seq d_model"]:
+        assert v1 is None or (v1 is not None and (v1.device == x.device))
         attn_out, v = self.attn(self.ln1(x), token_positions, v1=v1)
         prenorm_act_norm = x.detach().pow(2).mean(dim=-1).sqrt().mean()
         y = x + attn_out
@@ -118,7 +119,7 @@ class Transformer(nn.Module):
 
     def forward(self, x: Int[Tensor, "bs seq"]) -> Float[Tensor, "bs seq vocab_size"]:
         x: Float[Tensor, "bs seq d_model"] = self.embedding(x)
-        prenorm_activation_norms: Float[Tensor, n_layers] = torch.zeros(
+        prenorm_activation_norms: Float[Tensor, "n_layers"] = torch.zeros(
             (len(self.blocks),), dtype=x.dtype, device=x.device
         )
         v1 = None
@@ -136,8 +137,8 @@ class Transformer(nn.Module):
         self,
         prompt: Int[Tensor, "bs seq"],
         eos_token_id: int,
-        top_p: float = 1.0,
-        temperature: float = 1.0,
+        top_p: float = 0.4,
+        temperature: float = 0.7,
         max_steps: int = 32,
     ):
         """
@@ -149,7 +150,7 @@ class Transformer(nn.Module):
                 logits: Float[Tensor, "bs seq vocab"]
                 logits, _ = self.forward(input_seq)
                 if temperature == 0:
-                    out: Int[Tensor, bs] = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
+                    out: Int[Tensor, "bs"] = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
                 else:
                     probs: Float[Tensor, "bs vocab"] = softmax(logits, dim=-1, temperature=temperature)[:, -1, :]
                     # nucleous sampling
@@ -157,11 +158,10 @@ class Transformer(nn.Module):
                         sorted_values, sorted_idx = probs.sort(-1, descending=True)
                         mask = sorted_values.cumsum(-1) <= top_p
                         mask[:, 0] = True
-                        orig_mask = mask.gather(-1, sorted_idx.argsort(-1))
-                        for i in range(len(probs)):
-                            probs[i].masked_fill_(~orig_mask[i], 0.0)
-                            probs[i] /= probs[i].sum(-1)
-                    out: Int[Tensor, bs] = torch.multinomial(probs, 1)
+                        new_probs_mask = torch.zeros_like(probs, dtype=torch.bool).scatter_(-1, sorted_idx, mask)
+                        probs = probs * new_probs_mask
+                        probs = probs / probs.sum(-1, keepdim=True)
+                    out: Int[Tensor, "bs"] = torch.multinomial(probs, 1)
                 input_seq = torch.cat([input_seq, out], dim=-1)
                 if (out[-1:] == eos_token_id).all(dim=-1).item():
                     break
@@ -169,7 +169,7 @@ class Transformer(nn.Module):
 
     def forward_tp(self, x: Int[Tensor, "bs seq"]) -> Float[Tensor, "bs seq vocab_size"]:
         x: Float[Tensor, "bs seq d_model"] = self.embedding(x)
-        prenorm_activation_norms: Float[Tensor, n_layers] = torch.zeros(
+        prenorm_activation_norms: Float[Tensor, "n_layers"] = torch.zeros(
             (len(self.blocks),), dtype=x.dtype, device=x.device
         )
         v1 = None

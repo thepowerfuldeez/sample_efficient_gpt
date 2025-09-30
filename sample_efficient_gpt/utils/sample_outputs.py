@@ -19,10 +19,10 @@ def parse_args():
         "--tokenizer",
         default="/home/george/cs336_solutions/assignment1-basics/tokenizer/tinystories",
     )
-    p.add_argument("--top-p", default=0.95, type=float)
-    p.add_argument("--temperature", default=0.0, type=float)
+    p.add_argument("--top-p", default=0.4, type=float)
+    p.add_argument("--temperature", default=0.7, type=float)
     p.add_argument("--max-steps", default=512, type=int)
-    p.add_argument("--device", default="cuda:2", type=str)
+    p.add_argument("--device", default="cuda", type=str)
     return p.parse_args()
 
 

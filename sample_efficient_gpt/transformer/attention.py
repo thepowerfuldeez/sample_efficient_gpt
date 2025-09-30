@@ -7,6 +7,7 @@ from einops import einsum, rearrange
 
 from sample_efficient_gpt.transformer.core import Linear, softmax
 from sample_efficient_gpt.transformer.rope import RotatyPositionalEmbedding
+from sample_efficient_gpt.transformer.triton_flash_attn import TritonFlashAttnFunc
 
 
 def sdpa(
@@ -135,19 +136,22 @@ class MultiHeadSelfAttention(nn.Module):
             Q = self.rope(Q, token_positions)
             K = self.rope(K, token_positions)
 
-        V = rearrange(V, "b seq (h head_d) -> (h b) seq head_d", h=self.n_heads)
+        V = rearrange(V, "b seq (h head_d) -> (h b) seq head_d", h=self.n_heads).contiguous()
         if v1 is None:
             V1 = V
         else:
-            V1 = v1.view_as(V)
+            V1 = v1.view_as(V).contiguous()
 
         # value residual learning
         V = self.scale * (self.alpha1 * V + self.alpha2 * V1) * torch.rsqrt(self.alpha1**2 + self.alpha2**2 + 1e-8)
-        mask = torch.tril(torch.ones(seq_len, seq_len, device=Q.device, dtype=Q.dtype), diagonal=0).unsqueeze(0).bool()
+        assert V1.is_contiguous()
+        assert V.is_contiguous()
         if self.qknorm:
+            mask = torch.tril(torch.ones(seq_len, seq_len, device=Q.device, dtype=Q.dtype), diagonal=0).unsqueeze(0).bool()
             attn: Float[Tensor, "(h b) seq head_d"] = self.sdpa_qknorm(Q, K, V, mask)
         else:
-            attn: Float[Tensor, "(h b) seq head_d"] = sdpa(Q, K, V, mask)
+            attn: Float[Tensor, "(h b) seq head_d"] = TritonFlashAttnFunc.apply(Q, K, V, True)
+            # attn: Float[Tensor, "(h b) seq head_d"] = sdpa(Q, K, V, mask)
 
         attn_cat = rearrange(attn, "(h b) seq head_d -> b seq (h head_d)", h=self.n_heads)
 

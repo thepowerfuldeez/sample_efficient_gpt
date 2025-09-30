@@ -1,4 +1,9 @@
 __pycache__
+**/*.json
+**/*.npy
+**/*.txt
+**/*.pickle
+**/*.pt
 data/
 data_tokenized/
 **/__pycache__
