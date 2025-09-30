@@ -6,12 +6,16 @@ use ahash::AHashMap as Map;
 use std::collections::HashMap;
 use simdutf::validate_utf8;
 
-static SLOW_RE: Lazy<FRegex> = Lazy::new(|| {
-    FRegex::new(r#"\'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"#).unwrap()
-});
+// static SLOW_RE: Lazy<FRegex> = Lazy::new(|| {
+//     FRegex::new(r#"\'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"#).unwrap()
+// });
 
-// TODO: add digits grouping regexp
-// (?=(\d{3})+(?!\d))
+// Upgraded pattern with digits grouping
+static SLOW_RE: Lazy<FRegex> = Lazy::new(|| {
+    FRegex::new(
+        r#"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"#
+    ).unwrap()
+});
 
 
 /// Ignore invalid UTF-8 bytes (drop them rather than replacing with U+FFFD).

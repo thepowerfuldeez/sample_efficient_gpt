@@ -17,29 +17,8 @@ from sample_efficient_gpt.pretokenization import Splitter, pre_tokenize, find_ch
 logging.basicConfig(level=os.getenv("LOGLEVEL", logging.INFO))
 logger = logging.getLogger(__name__)
 
-PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+PAT = r"""(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"""
 PAT = re.compile(PAT)
-
-
-def pack_u16_np(view: np.ndarray) -> bytes:
-    # Treat input as unsigned 16-bit; avoid copies when possible
-    a = np.asarray(view, dtype=np.uint16)  # no copy if dtype already u16/i16
-    if not a.flags.c_contiguous:  # contiguous makes packing fast
-        a = np.ascontiguousarray(a)
-    # normalize to little-endian bytes so keys are stable across platforms
-    if a.dtype.byteorder not in ("<", "="):
-        a = a.byteswap().newbyteorder("<")
-    return a.tobytes()
-
-
-def unpack_u16_np(b: bytes) -> np.ndarray:
-    # Zero-copy read-only NumPy view over the bytes
-    return np.frombuffer(b, dtype=np.uint16)
-
-
-def unpack_u16(b):
-    # zero-copy view:
-    return memoryview(b).cast("H")  # returns a read-only sequence-like view
 
 
 class BPE:
@@ -496,8 +475,8 @@ class BPE:
                     should_change_left = True
                     doc_boundary_ptr += 1
             # we really don't need 1 token keys anymore
-            # For SuperBPE: just take 10% of data due to OOM
-            if right - left > 1 and (random.random() < 0.1 if superbpe else True):
+            # For SuperBPE: just take 25% of data due to OOM
+            if right - left > 1 and (random.random() < 0.25 if superbpe else True):
                 if superbpe:
                     length = right - left
                     # truncate by length
@@ -518,7 +497,12 @@ class BPE:
         return pre_token_counts
 
     def resume_train(
-        self, filepath: str, new_vocab_size: int, vocab_path: str, merges_path: str, superbpe: bool = True
+        self,
+        filepath: str,
+        new_vocab_size: int,
+        vocab_path: str,
+        merges_path: str,
+        superbpe: bool = True,
     ):
         """
         In this method, we are expecting already tokenized npy file for train
@@ -591,7 +575,7 @@ class BPE:
         return self.vocab, self.merges_tuples
 
     def save(self, iter: int | None = None):
-        if iter:
+        if iter is not None:
             vocab_path, merges_path = (
                 self.save_dir / f"{iter}_{self.vocab_name}",
                 self.save_dir / f"{iter}_{self.merges_name}",
@@ -604,19 +588,19 @@ class BPE:
 
 def parse_args():
     p = ArgumentParser()
-    p.add_argument("--data-path", default="data/owt_train.txt")
+    p.add_argument("--data-path", default="data_dclm_edu/train_sample.txt")
     # filepath = "data/TinyStoriesV2-GPT4-train.txt"
     # filepath = "data/TinyStoriesV2-GPT4-mid3.txt"
     # filepath = "data/TinyStoriesV2-GPT4-valid.txt"
     # filepath = "sample_efficient_gpt/test.txt"
     # filepath = "tests/fixtures/tinystories_sample_5M.txt"
-    p.add_argument("--vocab-size", type=int, default=32000)
-    p.add_argument("--num-processes", type=int, default=8)
-    p.add_argument("--save-every", type=int, default=10000)
-    p.add_argument("--save-dir", default=".")
+    p.add_argument("--vocab-size", type=int, default=32700)
+    p.add_argument("--num-processes", type=int, default=24)
+    p.add_argument("--save-every", type=int, default=5200)
+    p.add_argument("--save-dir", default="data_dclm_edu/tokenizer")
     p.add_argument("--resume-from-vocab", default="")
     p.add_argument("--resume-from-merges", default="")
-    p.add_argument("--superbpe", type=int, default=1)
+    p.add_argument("--superbpe", type=int, default=0)
     return p.parse_args()
 
 
