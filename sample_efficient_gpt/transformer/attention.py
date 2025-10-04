@@ -8,21 +8,7 @@ from einops import einsum, rearrange
 from sample_efficient_gpt.transformer.core import Linear, softmax
 from sample_efficient_gpt.transformer.rope import RotatyPositionalEmbedding
 from sample_efficient_gpt.transformer.triton_flash_attn import TritonFlashAttnFunc
-
-
-def sdpa(
-    q: Float[Tensor, "... seq_len d_k"],
-    k: Float[Tensor, "... seq_len d_k"],
-    v: Float[Tensor, "... seq_len d_k"],
-    mask: Float[Tensor, "... seq_len seq_len"] | None = None,
-) -> Float[Tensor, "... seq_len d_k"]:
-    with torch.autocast("cuda", enabled=False):
-        attn_scores = einsum(q, k, "... s1 d_k, ... s2 d_k -> ... s1 s2")
-        attn_scores *= torch.rsqrt(torch.tensor(q.size(-1)))
-        if mask is not None:
-            attn_scores.masked_fill_(~mask, float("-inf"))
-        probs = softmax(attn_scores, -1)
-    return probs @ v
+from sample_efficient_gpt.transformer.triton_flash_attn_qknorm import TritonFlashAttnQKNormFunc
 
 
 class SelfDotProductAttnQKNorm(nn.Module):
@@ -35,22 +21,12 @@ class SelfDotProductAttnQKNorm(nn.Module):
 
     def forward(
         self,
-        q: Float[Tensor, "... seq_len d_k"],
-        k: Float[Tensor, "... seq_len d_k"],
-        v: Float[Tensor, "... seq_len d_k"],
-        mask: Float[Tensor, "... seq_len seq_len"] | None = None,
+        Q: Float[Tensor, "... seq_len d_k"],
+        K: Float[Tensor, "... seq_len d_k"],
+        V: Float[Tensor, "... seq_len d_k"],
+        is_causal: bool = True
     ) -> Float[Tensor, "... seq_len d_k"]:
-        with torch.autocast("cuda", enabled=False):
-            q_norm = q / torch.linalg.norm(q, dim=-1, keepdim=True)
-            k_norm = k / torch.linalg.norm(k, dim=-1, keepdim=True)
-            attn_scores = einsum(q_norm, k_norm, "... s1 d_k, ... s2 d_k -> ... s1 s2")
-            # multiply by learnable parameter
-            attn_scores *= self.gain
-            if mask is not None:
-                attn_scores.masked_fill_(~mask, float("-inf"))
-            # with nvtx.range("attn softmax"):
-            probs = softmax(attn_scores, -1)
-        return probs @ v
+        return TritonFlashAttnQKNormFunc.apply(Q, K, V, self.gain, is_causal)
 
 
 # Modification using regular RMSNorm with sqrt(d) scaling
@@ -147,8 +123,7 @@ class MultiHeadSelfAttention(nn.Module):
         assert V1.is_contiguous()
         assert V.is_contiguous()
         if self.qknorm:
-            mask = torch.tril(torch.ones(seq_len, seq_len, device=Q.device, dtype=Q.dtype), diagonal=0).unsqueeze(0).bool()
-            attn: Float[Tensor, "(h b) seq head_d"] = self.sdpa_qknorm(Q, K, V, mask)
+            attn: Float[Tensor, "(h b) seq head_d"] = self.sdpa_qknorm(Q, K, V, True)
         else:
             attn: Float[Tensor, "(h b) seq head_d"] = TritonFlashAttnFunc.apply(Q, K, V, True)
             # attn: Float[Tensor, "(h b) seq head_d"] = sdpa(Q, K, V, mask)
