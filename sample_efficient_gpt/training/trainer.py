@@ -7,6 +7,7 @@ import torch
 from torch import Tensor
 from jaxtyping import Int
 from tqdm.auto import tqdm
+from transformers import PreTrainedTokenizerFast
 
 from sample_efficient_gpt.transformer import Transformer
 from sample_efficient_gpt.training import (
@@ -116,20 +117,9 @@ class Trainer:
         if self.cfg.trainer.dtype == "bfloat16":
             self.scaler = torch.amp.grad_scaler.GradScaler()
 
-        tokenizer_path = "/home/george/cs336_solutions/assignment1-basics/tokenizer/owt"
-        tokenizer = Tokenizer.from_files(
-            Path(tokenizer_path) / "vocab.pickle",
-            Path(tokenizer_path) / "merges.pickle",
-            special_tokens=["<|endoftext|>"],
-        )
-        eos_token_id = tokenizer.encode(tokenizer.special_tokens[0])[0]
-        self.generate_fn = lambda prompt: tokenizer.decode(
-            self.generate(
-                torch.tensor(tokenizer.encode(prompt)).unsqueeze(0).to(self.cfg.trainer.device), eos_token_id
-            )[0]
-            .cpu()
-            .tolist()
-        )
+        tokenizer_path = self.cfg.data.tokenizer_path
+        self.tokenizer = PreTrainedTokenizerFast.from_pretrained(tokenizer_path)
+        self.eos_token_id = list(self.tokenizer.added_tokens_decoder)[0]
         self.mbbp_evaluator = SimpleMBPPEvaluator(dataset="lite", timeout=8.0)
 
     def _init_optimizers(self):
@@ -213,7 +203,7 @@ class Trainer:
 
     def generate(
         self,
-        prompt: Int[Tensor, "bs seq"],
+        prompt: str,
         eos_token_id: int,
         top_p: float = 1.0,
         temperature: float = 0.0,
@@ -222,7 +212,17 @@ class Trainer:
         """
         Perform decoding with nucleous sampling and temperature
         """
-        return self.model.generate(prompt, eos_token_id, top_p=top_p, temperature=temperature, max_steps=max_steps)
+        prompt_encoded = torch.tensor(self.tokenizer.encode(prompt)).unsqueeze(0).to(self.cfg.trainer.device)
+        generated, eos_probs = self.model.generate(
+            prompt_encoded,
+            eos_token_id,
+            top_p=top_p,
+            temperature=temperature,
+            max_steps=max_steps,
+            eos_prob_multiplier=eos_prob_multiplier,
+        )
+        decoded = self.tokenizer.decode(generated[0].cpu().tolist())
+        return decoded
 
     def validate(self):
         mem("before validation")
@@ -250,8 +250,8 @@ class Trainer:
 
         return {
             "val_loss": val_loss_epoch,
-            "val_perplexity": math.exp(val_loss_epoch),
-            "mbpp_lite_pass_1": metrics["pass_at_k"]["base"]["pass@1"]
+            "val_perplexity": 2**val_loss_epoch,
+            # "mbpp_lite_pass_1": metrics["pass_at_k"]["base"]["pass@1"]
         }
 
     def _get_lr(self, lr, lr_min):
@@ -287,13 +287,14 @@ class Trainer:
         for pg in self.optimizers[0].param_groups:
             pg["lr"] = iter_lr
 
+        iter_wd = None
         if self.cfg.optim.use_muon:
             # second optimizer is muon
             iter_lr = self._get_lr(self.cfg.optim.muon_lr, self.cfg.optim.muon_lr * self.cfg.optim.lr_min_coeff)
             if self.cfg.optim.muon_wd_min is not None:
-                iter_wd = self._get_lr(self.cfg.optim.muon_wd, self.cfg.optim.muon_wd_min)
-            else:
-                iter_wd = None
+                # just a linear warmup
+                ratio = 1 - (self.cfg.trainer.max_steps - self.iteration) / self.cfg.trainer.max_steps
+                iter_wd = self.cfg.optim.muon_wd_min + ratio * (self.cfg.optim.muon_wd - self.cfg.optim.muon_wd_min)
 
             for pg in self.optimizers[1].param_groups:
                 # momentum warmup for fixed 300 steps
@@ -302,12 +303,11 @@ class Trainer:
                 pg["lr"] = iter_lr
                 if iter_wd is not None:
                     pg["wd"] = iter_wd
-            return iter_lr
-        return iter_lr
+        return iter_lr, iter_wd
 
     def train_step(self, inputs, targets):
         self.model.train()
-        iter_lr = self._set_lr()
+        iter_lr, iter_wd = self._set_lr()
 
         z_loss_weight = self.cfg.trainer.z_loss_weight
 
@@ -346,26 +346,29 @@ class Trainer:
         }
         train_loss = loss.detach()
         z_loss = z_loss.detach()
-        return {
+        log = {
             "train_loss": train_loss * self.cfg.trainer.gradient_accumulation_steps,
             "z_loss": z_loss * self.cfg.trainer.gradient_accumulation_steps,
             "grad_norm": grad_norm,
-            "lr": iter_lr,
+            "learning_rate": iter_lr,
             "update_ratio": update_ratio,
             "prenorm_activation_norms": prenorm_activation_norms,
             "parameter_norms": parameter_norms,
         }
+        if iter_wd is not None:
+            log["wd"] = iter_wd
+        return log
 
     def postprocess_step_stats(self, step_stats):
-        return {
+        log_processed = {
             "train_loss": step_stats["train_loss"].item(),
             "z_loss": step_stats["z_loss"].item(),
             "grad_norm": step_stats["grad_norm"].item(),
-            "lr": step_stats["lr"],
-            "update_ratio": step_stats["update_ratio"],
             "prenorm_activation_norms": step_stats["prenorm_activation_norms"].cpu().tolist(),
             "parameter_norms": {k: v.item() for k, v in step_stats["parameter_norms"].items()},
         }
+        # take any other key as it is
+        return {**log_processed, **{k: v for k, v in step_stats.items() if k not in log_processed}}
 
     def train(self):
         logger.info("Starting training loop")
@@ -391,7 +394,8 @@ class Trainer:
                         "train/loss": step_stats["train_loss"],
                         "train/z_loss": step_stats["z_loss"],
                         "train/grad_norm": step_stats["grad_norm"],
-                        "train/learning_rate": step_stats["lr"],
+                        "train/learning_rate": step_stats["learning_rate"],
+                        "train/wd": step_stats["wd"],
                         "train/update_ratio": step_stats["update_ratio"],
                         "train/step": self.iteration,
                         "train/step_time": t1 - t0,

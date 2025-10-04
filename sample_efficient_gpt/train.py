@@ -37,8 +37,14 @@ def train(cfg: Config, args):
     s = ""
     for k, v in override.items():
         s += f"{k.split('.')[-1][:4]}={str(v)[:4]}"
-    run_name: str = wandb_run_name(cfg)[:47]
-    run_name = f"{run_name}_{s}"
+    if "run_name" in args.override:
+        # no need to extract k-v pairs if specified run name manually
+        cfg.trainer.run_name = override["trainer.run_name"]
+        run_name: str = wandb_run_name(cfg)
+        print("run name overriden")
+    else:
+        run_name: str = wandb_run_name(cfg)[:47]
+        run_name = f"{run_name}_{s}"
     logger.info(f"Training run: {run_name}")
 
     override = {
