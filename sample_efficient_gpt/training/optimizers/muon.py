@@ -2,45 +2,10 @@ import torch
 from torch import Tensor
 import torch.cuda.nvtx as nvtx
 
-# from sample_efficient_gpt.training.optimizers.muon_triton import newton_schulz_triton
+from sample_efficient_gpt.training.optimizers.muon_triton import newton_schulz_triton
 
 # -----------------------------------------------------------------------------
 # Muon optimizer
-
-
-@torch.compile
-def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
-    """
-    Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
-    quintic iteration whose coefficients are selected to maximize the slope at zero. For the purpose
-    of minimizing steps, it turns out to be empirically effective to keep increasing the slope at
-    zero even beyond the point where the iteration no longer converges all the way to one everywhere
-    on the interval. This iteration therefore does not produce UV^T but rather something like US'V^T
-    where S' is diagonal with S_{ii}' ~ Uniform(0.5, 1.5), which turns out not to hurt model
-    performance at all relative to UV^T, where USV^T = G is the SVD.
-    """
-    assert (
-        G.ndim >= 2
-    )  # batched Muon implementation by @scottjmaddox, and put into practice in the record by @YouJiacheng
-    a, b, c = (3.4445, -4.7750, 2.0315)
-    X = G
-    if G.size(-2) > G.size(-1):
-        X = X.mT
-
-    # Ensure spectral norm is at most 1
-    X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
-    # Perform the NS iterations
-    for _ in range(steps):
-        A = X @ X.mT
-        B = (
-            b * A + c * A @ A
-        )  # quintic computation strategy adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
-        X = a * X + B @ X
-
-    if G.size(-2) > G.size(-1):
-        X = X.mT
-    return X
-
 
 class Muon(torch.optim.Optimizer):
     """
@@ -68,7 +33,7 @@ class Muon(torch.optim.Optimizer):
             param_groups.append(dict(params=group_params))
         super().__init__(param_groups, defaults)
 
-    @nvtx.range("muon step")
+    # @nvtx.range("muon step")
     @torch.no_grad()
     def step(self):
         for group in self.param_groups:
@@ -95,6 +60,5 @@ class Muon(torch.optim.Optimizer):
                 # interpolate momentum
                 momentum_buffer.lerp_(grad, 1 - momentum)
                 grad = grad.lerp_(momentum_buffer, momentum)
-                # v = newton_schulz_triton(grad.bfloat16(), 5)
-                v = zeropower_via_newtonschulz5(grad.bfloat16(), 5)
+                v = newton_schulz_triton(grad.bfloat16())
                 p.add_(other=v, alpha=-eff_lr)
