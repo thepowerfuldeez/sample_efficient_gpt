@@ -51,7 +51,7 @@ class ModelConfig:
 @dataclass(frozen=False)
 class TrainerConfig:
     load_from: str | None = None
-    device: str = "cuda:2"
+    device: str = "cuda"
     dtype: Literal["float32", "bfloat16"] = "float32"
     max_steps: int = 200_000
     z_loss_weight: float = 1e-4

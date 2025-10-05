@@ -140,19 +140,24 @@ class Transformer(nn.Module):
         top_p: float = 0.4,
         temperature: float = 0.7,
         max_steps: int = 32,
-    ):
+        eos_prob_multiplier: float = 1.0
+    ) -> tuple[Tensor, Tensor]:
         """
         Perform decoding with nucleous sampling and temperature
+
+        returns generated sampled token ids + EOS probs at each step for debugging
         """
         input_seq = prompt
         with torch.inference_mode():
             for _ in tqdm(range(max_steps)):
                 logits: Float[Tensor, "bs seq vocab"]
                 logits, _ = self.forward(input_seq)
+                all_probs = softmax(logits, dim=-1, temperature=temperature)
                 if temperature == 0:
-                    out: Int[Tensor, "bs"] = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
+                    out: Int[Tensor, "bs"] = torch.argmax(all_probs[:, -1, :], dim=-1, keepdim=True)
                 else:
-                    probs: Float[Tensor, "bs vocab"] = softmax(logits, dim=-1, temperature=temperature)[:, -1, :]
+                    probs: Float[Tensor, "bs vocab"] = all_probs[:, -1, :]
+                    probs[:, eos_token_id] *= eos_prob_multiplier
                     # nucleous sampling
                     if top_p < 1.0:
                         sorted_values, sorted_idx = probs.sort(-1, descending=True)
@@ -165,7 +170,7 @@ class Transformer(nn.Module):
                 input_seq = torch.cat([input_seq, out], dim=-1)
                 if (out[-1:] == eos_token_id).all(dim=-1).item():
                     break
-        return input_seq
+        return input_seq, all_probs[:, :, eos_token_id]
 
     def forward_tp(self, x: Int[Tensor, "bs seq"]) -> Float[Tensor, "bs seq vocab_size"]:
         x: Float[Tensor, "bs seq d_model"] = self.embedding(x)
