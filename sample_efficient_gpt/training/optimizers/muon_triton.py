@@ -18,9 +18,9 @@ def _get_autotune_configs():
             num_warps=warps,
         )
         for bm in [64, 128]
-        for bn in [64, 128, 256]
+        for bn in [64, 128]
         for bk in [64, 128]
-        for stages, warps in [(3, 4), (3, 8), (4, 4)]
+        for stages, warps in ((2,4), (3,4), (3,8))
         if bm // bn <= 2 and bn // bm <= 2
     ]
 
@@ -337,6 +337,7 @@ def newton_schulz_triton(G: Tensor, epsilon: float = 1e-7):
         (2.8366, -3.0525, 1.2012),
     ]
 
+    assert G.is_cuda
     X = G.to(dtype=torch.bfloat16)
     if G.size(-2) > G.size(-1):
         X = X.mT
