@@ -24,7 +24,7 @@ class SelfDotProductAttnQKNorm(nn.Module):
         Q: Float[Tensor, "... seq_len d_k"],
         K: Float[Tensor, "... seq_len d_k"],
         V: Float[Tensor, "... seq_len d_k"],
-        is_causal: bool = True
+        is_causal: bool = True,
     ) -> Float[Tensor, "... seq_len d_k"]:
         return TritonFlashAttnQKNormFunc.apply(Q, K, V, self.gain, is_causal)
 
@@ -91,10 +91,17 @@ class MultiHeadSelfAttention(nn.Module):
                 torch.tensor(0.0, device=device),
                 torch.tensor(1.0, device=device),
             )
+
         # elementwise SDPA gating on attention after concat
         self.gating = gating
         if self.gating:
-            self.attn_gate = Linear(d_model, d_model, device=device, dtype=dtype)
+            if self.gating == "elementwise":
+                self.attn_gate = Linear(d_model, d_model, device=device, dtype=dtype)
+            elif self.gating == "per-head":
+                # gating single scalar per head
+                self.attn_gate = Linear(d_model, n_heads, device=device, dtype=dtype)
+            else:
+                raise ValueError(f"{self.gating=} is undefined")
 
     def forward(
         self,
@@ -126,13 +133,22 @@ class MultiHeadSelfAttention(nn.Module):
             attn: Float[Tensor, "(h b) seq head_d"] = self.sdpa_qknorm(Q, K, V, True)
         else:
             attn: Float[Tensor, "(h b) seq head_d"] = TritonFlashAttnFunc.apply(Q, K, V, True)
-            # attn: Float[Tensor, "(h b) seq head_d"] = sdpa(Q, K, V, mask)
 
-        attn_cat = rearrange(attn, "(h b) seq head_d -> b seq (h head_d)", h=self.n_heads)
+        if not self.gating:
+            attn_cat = rearrange(attn, "(h b) seq head_d -> b seq (h head_d)", h=self.n_heads)
+        else:
+            if self.gating == "elementwise":
+                attn_cat = rearrange(attn, "(h b) seq head_d -> b seq (h head_d)", h=self.n_heads)
+                # apply gating after concat and before out
+                attn_cat = self.attn_gate(x).sigmoid() * attn_cat
+            elif self.gating == "per-head":
+                # apply gating (single scalar per each head)
+                gate: Float[Tensor, "b seq h 1"] = self.attn_gate(x).sigmoid().unsqueeze(-1)
+                attn: Float[Tensor, "b seq h head_d"] = rearrange(
+                    attn, "(h b) seq head_d -> b seq h head_d", h=self.n_heads
+                )
+                attn_cat = rearrange(gate * attn, "b seq h head_d -> b seq (h head_d)", h=self.n_heads)
 
-        # apply gating after concat and before out
-        if self.gating:
-            attn_cat = self.attn_gate(x).sigmoid() * attn_cat
         attn_out = self.out(attn_cat)
         # pass current value vector
         return attn_out, V

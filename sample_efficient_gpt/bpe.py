@@ -423,7 +423,9 @@ class BPE:
             def process_diffs(diffs, word_boundaries):
                 to_add = []
                 for i, d in enumerate(diffs):
+                    # split only if word is longer than 20
                     if d >= 20:
+                        # split by 10 tokens max
                         n_additions = min(d // 10, 11)
                         # corresponds to i, i+1 in word_boundaries
                         left = word_boundaries[i]
@@ -443,6 +445,7 @@ class BPE:
                 ~np.isin(pre_punctuation_boundaries, word_boundaries)
             ]
             word_boundaries = np.concatenate((word_boundaries, pre_punctuation_boundaries))
+            # whitespace and punctuation boundaries together
             word_boundaries.sort(kind="mergesort")
 
             # filter by length

@@ -11,8 +11,9 @@ Main achievements that makes this framework stand out across others:
 3. Muon + Triton implementation from Dion repo
 4. LayerNorm Scaling (https://arxiv.org/abs/2502.05795)
 5. QK-Norm + I wrote Flash attention QK-norm kernel for max efficiency
-6. muP parametrization (reference from https://arxiv.org/abs/2505.02222)
-7. SuperBPE tokenizer with the conversion to HF tokenizers (https://arxiv.org/abs/2503.13423)
+6. Z-loss (https://arxiv.org/pdf/2204.02311)
+7. muP parametrization (reference from https://arxiv.org/abs/2505.02222)
+8. SuperBPE tokenizer with the conversion to HF tokenizers (https://arxiv.org/abs/2503.13423)
 
 
 Various optimization tricks, such as momentum warmup, WD schedule
