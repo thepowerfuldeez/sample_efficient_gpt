@@ -1,5 +1,6 @@
 from pathlib import Path
 from collections.abc import Iterator
+from bisect import bisect
 
 import torch
 import numpy as np
@@ -16,19 +17,37 @@ class MemoryMappedDataset:
         context_length: int,
         device: str = "mps",
         seed: int | None = None,
+        world_size: int = 1,
+        rank: int = 0,
     ):
         """
         Reads numpy file in memory mapped mode
         Samples `context_length` chunks
+
+        Can also accept a folder with .npy files (chunked dataset)
+
+        Can also take only `rank` part of the batch for DDP training
         """
-        if isinstance(path_or_ds, np.ndarray):
-            self.ds = path_or_ds
+        path_or_ds = Path(path_or_ds)
+        if path_or_ds.is_dir():
+            # dataset contains npz files
+            total_length = 0
+            ds = []
+            lengths = [0]
+            for fp in sorted(path_or_ds.glob("*.npy")):
+                if "offsets_" in fp.name:
+                    continue
+                ds_fp = self._read_file(fp)
+                l = ds_fp.shape[0]
+                total_length += l
+                lengths.append(total_length)
+                ds.append(ds_fp)
+            self.total_length = total_length
+            self.ds = ds
+            self.lengths = lengths
         else:
-            self.ds = np.load(path_or_ds, mmap_mode="r")
-            # npz is a dict-like with key 'values'
-            if hasattr(self.ds, "files"):
-                self.ds = self.ds["values"]
-        self.total_length = self.ds.shape[0]
+            self.ds = self._read_file(path_or_ds)
+            self.total_length = self.ds.shape[0]
         logger.info(f"Dataset length: {self.total_length}")
         self.context_length = context_length
         self.device = device
@@ -37,13 +56,39 @@ class MemoryMappedDataset:
         else:
             self.g = None
 
+        self.world_size = world_size
+        self.rank = rank
+        self.is_distributed = world_size > 1
+        self.local_batch_size = None
+
+    def _read_file(self, path):
+        ds = np.load(path, mmap_mode="r")
+        return ds
+
     def __getitem__(self, i: int) -> tuple[Int[Tensor, "context"], Int[Tensor, "context"]]:
         """
         i can be anything from 0 to self.__len__
         """
         i_finish = i + self.context_length + 1
-        # print(len(self.ds), self.__len__(), i, i_finish)
-        chunk = self.ds[i:i_finish].astype(np.int32)
+        if isinstance(self.ds, list):
+            ds_chunk_left = bisect(self.lengths, i) - 1
+            ds_chunk_right = bisect(self.lengths, i_finish) - 1
+            if ds_chunk_left < ds_chunk_right:
+                # this means that data spans across multiple dataset chunks
+                chunk_start = self.ds[ds_chunk_left][(i - self.lengths[ds_chunk_left]) :].astype(np.int32)
+                # fmt: off
+                mid = [np.asaray(self.ds[ds_chunk_i]).astype(np.int32) 
+                       for ds_chunk_i in range(ds_chunk_left + 1, ds_chunk_right)]
+                if mid:
+                    chunk_mid = np.concat(mid)
+                # fmt: on
+                chunk_finish = self.ds[ds_chunk_right][: (i_finish - self.lengths[ds_chunk_right])].astype(np.int32)
+                chunk = np.concat([chunk_start, chunk_mid, chunk_finish] if mid else [chunk_start, chunk_finish])
+            else:
+                l = self.lengths[ds_chunk_left]
+                chunk = self.ds[ds_chunk_left][(i - l) : (i_finish - l)].astype(np.int32)
+        else:
+            chunk = self.ds[i:i_finish].astype(np.int32)
         inputs = torch.from_numpy(chunk[:-1]).to(device=self.device)
         targets = torch.from_numpy(chunk[1:]).to(device=self.device)
         return inputs, targets
@@ -69,13 +114,51 @@ class MemoryMappedDataset:
     def get_batch(self, batch_size: int) -> tuple[Int[Tensor, "bs context"], Int[Tensor, "bs context"]]:
         """
         Get a batch of data from memory mapped x: np.ndarray
+
+        If run in distributed context, will return correct chunk of data instead of full batch size
         """
-        batch_inputs = torch.empty((batch_size, self.context_length), device=self.device, dtype=torch.int32)
-        batch_targets = torch.empty((batch_size, self.context_length), device=self.device, dtype=torch.int32)
-        # sampler
+        if self.is_distributed:
+            # We want to split unevenly across workers
+            target_log_rank = 0
+            small_batch_size = batch_size // self.world_size
+            # Hack for GPUS which are uneven in their power
+            gpu_names = [torch.cuda.get_device_name(i) for i in range(self.world_size)]
+            if (
+                self.world_size == 3
+                and any(["RTX 5090" in s for s in gpu_names])
+                and any(["RTX 4090" in s for s in gpu_names])
+            ):
+                for i in range(self.world_size):
+                    if "RTX 5090" in torch.cuda.get_device_name(i):
+                        target_log_rank = i
+                adj_n_chunks = 7
+                small_batch_size = (batch_size // adj_n_chunks) * 2
+                large_batch_size = (batch_size // adj_n_chunks) * 3
+                local_batch_size = large_batch_size if self.rank == target_log_rank else small_batch_size
+            else:
+                local_batch_size = small_batch_size
+        else:
+            local_batch_size = batch_size
+        self.local_batch_size = local_batch_size
+
+        batch_inputs = torch.empty((local_batch_size, self.context_length), device=self.device, dtype=torch.int32)
+        batch_targets = torch.empty((local_batch_size, self.context_length), device=self.device, dtype=torch.int32)
+
+        # sampler (will be sampled deterministically at all devices)
         sampled_indices = torch.randint(low=0, high=len(self), size=(batch_size,), generator=self.g)
-        for sample_idx in range(batch_size):
-            inputs, targets = self.__getitem__(sampled_indices[sample_idx].item())
+
+        if self.is_distributed:
+            # we split the work unevenly
+            if self.rank == target_log_rank:
+                offset = self.rank * small_batch_size
+            else:
+                offset = self.rank * local_batch_size
+            local_sampled_indices = sampled_indices[offset : offset + local_batch_size]
+        else:
+            local_sampled_indices = sampled_indices
+
+        for sample_idx in range(local_batch_size):
+            inputs, targets = self.__getitem__(local_sampled_indices[sample_idx].item())
             batch_inputs[sample_idx] = inputs
             batch_targets[sample_idx] = targets
         return batch_inputs, batch_targets

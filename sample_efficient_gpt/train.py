@@ -1,7 +1,11 @@
 import argparse
 import json
+import os
 from pathlib import Path
 
+import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 import wandb
 
 from sample_efficient_gpt.configs.gpt_small_faster import cfg
@@ -11,25 +15,35 @@ from sample_efficient_gpt.training.trainer import Trainer
 from sample_efficient_gpt.utils.logger import logger
 from sample_efficient_gpt.utils.config_tools import apply_overrides
 
+BACKEND = "nccl"
+
+
+def setup(rank, world_size):
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = "29500"
+    if BACKEND != "gloo":
+        torch.cuda.set_device(f"cuda:{rank}")
+    dist.init_process_group(BACKEND, rank=rank, world_size=world_size)
+
+
+def shutdown():
+    dist.destroy_process_group()
+
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument(
-        "--train-path",
-        type=str,
-        default=str(Path(__file__).parent.parent / "data_tokenized/TinyStoriesV2-GPT4-train.npy"),
-    )
-    p.add_argument(
-        "--validation-path",
-        type=str,
-        default=str(Path(__file__).parent.parent / "data_tokenized/TinyStoriesV2-GPT4-valid.npy"),
-    )
+    p.add_argument("--train-path", type=str, required=True)
+    p.add_argument("--validation-path", type=str, required=True)
     p.add_argument("--override", type=str, help='{"k": "v"} override to the cfg as dict')
     p.add_argument("--config", type=str, default="gpt_small_faster", help="config path, default: gpt_small_faster")
+    p.add_argument("--world-size", type=int, default=1)
     return p.parse_args()
 
 
-def train(cfg: Config, args):
+def train(rank, cfg: Config, args):
+    if args.world_size > 1:
+        setup(rank, args.world_size)
+
     if args.override:
         override = json.loads(args.override)
     else:
@@ -56,21 +70,31 @@ def train(cfg: Config, args):
     cfg = apply_overrides(cfg, override)
     overrides = {"optim.cosine_steps": cfg.trainer.max_steps}
     cfg = apply_overrides(cfg, overrides)
-    cfg.trainer.save_dir = cfg.trainer.save_dir / s
+    cfg.trainer.save_dir = cfg.trainer.save_dir / run_name
 
-    run = wandb.init(project=cfg.project, name=run_name, config=dataclass_to_nested_dict(cfg))
+    if (args.world_size > 1 and rank == 2) or (args.world_size == 1 and rank == 0):
+        run = wandb.init(project=cfg.project, name=run_name, config=dataclass_to_nested_dict(cfg))
+    else:
+        run = None
     trainer = Trainer(cfg, wandb=run)
     trainer.train()
 
     run.finish()
+    if args.world_size > 1:
+        shutdown()
 
 
-def test(cfg: Config):
-    import torch
-
-    trainer = Trainer(cfg)
-    print(trainer.generate(torch.tensor([0, 1, 2]), 5, top_p=0.8, temperature=0.1))
-
-
-train(cfg, parse_args())
-# test(cfg)
+if __name__ == "__main__":
+    args = parse_args()
+    if args.world_size > 1:
+        mp.spawn(
+            train,
+            args=(
+                cfg,
+                args,
+            ),
+            nprocs=args.world_size,
+            join=True,
+        )
+    else:
+        train(0, cfg, args)

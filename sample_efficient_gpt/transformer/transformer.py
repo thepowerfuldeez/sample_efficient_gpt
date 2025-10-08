@@ -50,9 +50,14 @@ class Block(nn.Module):
     ) -> Float[Tensor, "b seq d_model"]:
         assert v1 is None or (v1 is not None and (v1.device == x.device))
         attn_out, v = self.attn(self.ln1(x), token_positions, v1=v1)
-        prenorm_act_norm = x.detach().pow(2).mean(dim=-1).sqrt().mean()
+        # prenorm_act_norm = x.detach().pow(2).mean(dim=-1).sqrt().mean()
+        # kurtosis
+        x_f = x.detach().to(torch.float32)
+        m2 = x_f.pow(2).mean(-1).clamp_min(1e-8)
+        m4 = x_f.pow(4).mean(-1)
+        avg_kurtosis = (m4 / (m2 * m2)).mean()
         y = x + attn_out
-        return y + self.ffn(self.ln2(y)), prenorm_act_norm, v
+        return y + self.ffn(self.ln2(y)), avg_kurtosis, v
 
     def forward_tp(
         self,
@@ -119,19 +124,19 @@ class Transformer(nn.Module):
 
     def forward(self, x: Int[Tensor, "bs seq"]) -> Float[Tensor, "bs seq vocab_size"]:
         x: Float[Tensor, "bs seq d_model"] = self.embedding(x)
-        prenorm_activation_norms: Float[Tensor, "n_layers"] = torch.zeros(
+        avg_kurtosis_values: Float[Tensor, "n_layers"] = torch.zeros(
             (len(self.blocks),), dtype=x.dtype, device=x.device
         )
         v1 = None
         for i, layer in enumerate(self.blocks):
             # with nvtx.range(f"block {i}"):
             # pass residual value
-            x, prenorm_act_norm, v = layer(x, v1=v1)
+            x, avg_kurtosis, v = layer(x, v1=v1)
             if v1 is None:
                 v1 = v
-            prenorm_activation_norms[i] = prenorm_act_norm
+            avg_kurtosis_values[i] = avg_kurtosis
         x = self.final_norm(x)
-        return self.lm_head(x), prenorm_activation_norms
+        return self.lm_head(x), avg_kurtosis_values
 
     def generate(
         self,
@@ -140,7 +145,7 @@ class Transformer(nn.Module):
         top_p: float = 0.4,
         temperature: float = 0.7,
         max_steps: int = 32,
-        eos_prob_multiplier: float = 1.0
+        eos_prob_multiplier: float = 1.0,
     ) -> tuple[Tensor, Tensor]:
         """
         Perform decoding with nucleous sampling and temperature

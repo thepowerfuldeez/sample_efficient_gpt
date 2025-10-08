@@ -55,7 +55,8 @@ class TokenizerProcessor:
                 if not "stack" in str(chunk_path):
                     ds = ds.map(lambda ex: {"text": ex["text"] + "<|endoftext|>"}, num_proc=4, load_from_cache_file=False)
                 tokens, offsets = self._process_ds(ds)
-                np.savez(str((tokenized_path / chunk_path.stem).with_suffix(".npz")), values=tokens, offsets=offsets)
+                np.save(str((tokenized_path / chunk_path.stem).with_suffix(".npy")), tokens)
+                np.save(str((tokenized_path / f"offsets_{chunk_path.stem}").with_suffix(".npy")), offsets)
         elif jsonl_files:
             # for marin-arxiv
             # chunk_size = 50
@@ -183,7 +184,8 @@ class TokenizerProcessor:
 
 def parse_args():
     p = ArgumentParser()
-    p.add_argument("--tokenizer-name", default="thepowerfuldeez/0925_bigbench_code_tokenizer")
+    # p.add_argument("--tokenizer-name", default="thepowerfuldeez/0925_bigbench_code_tokenizer")
+    p.add_argument("--tokenizer-name", default="data_dclm_edu/tokenizer_superbpe_hf/")
     p.add_argument("--data-path", default="/mnt/harddrive/datasets/bigcode_the_stack_v2_updated_smol/")
     p.add_argument(
         "--tokenized-data-path", default="/mnt/harddrive/datasets/bigcode_the_stack_v2_updated_smol/tokenized_54770"

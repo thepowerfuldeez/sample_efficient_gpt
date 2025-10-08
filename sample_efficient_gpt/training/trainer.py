@@ -2,8 +2,10 @@ import math
 import time
 from pathlib import Path
 from typing import Any
+from contextlib import nullcontext
 
 import torch
+import torch.distributed as dist
 from torch import Tensor
 from jaxtyping import Int
 from tqdm.auto import tqdm
@@ -26,6 +28,7 @@ from sample_efficient_gpt.config_schema import Config
 from sample_efficient_gpt.utils.logger import logger
 from sample_efficient_gpt.utils.config_tools import load_config, apply_overrides
 
+from sample_efficient_gpt.training.ddp import DDP
 from sample_efficient_gpt.tokenizer import Tokenizer
 from sample_efficient_gpt.evals.mbpp_eval import SimpleMBPPEvaluator
 
@@ -37,6 +40,59 @@ def mem(tag):
     alloc = torch.cuda.memory_allocated() / 1e9
     resv = torch.cuda.memory_reserved() / 1e9
     logger.info(f"{tag}: allocated={alloc:.2f} GB, reserved={resv:.2f} GB")
+
+
+# class DDP:
+#     def __init__(self, module):
+#         self.module = module
+
+#     def forward(self, *args, **kwargs):
+#         return self.module(*args, **kwargs)
+
+#     def finish_gradient_synchronization(self) -> float:
+#         torch.cuda.synchronize()
+#         t0 = time.monotonic()
+
+#         groups = {}
+#         for n, p in list(self.module.named_parameters())[::-1]:
+#             if p.grad is not None:
+#                 g = p.grad
+#                 groups.setdefault(g.dtype, []).append(g)
+
+#         total_bytes = 0
+#         bucket_to_tensors = {}
+#         cur_bucket_id = -1
+#         # 250 MB buckets
+#         bucket_size = 250 * 1024 * 1024
+#         for dt, group in groups.items():
+#             cur_bucket_size = 0
+#             cur_bucket_id += 1
+#             for g in group:
+#                 tensor_bytes = g.numel() * g.itemsize
+#                 total_bytes += tensor_bytes
+#                 cur_bucket_size += tensor_bytes
+#                 bucket_to_tensors.setdefault(cur_bucket_id, []).append(g)
+#                 if cur_bucket_size > bucket_size:
+#                     cur_bucket_id += 1
+#                     cur_bucket_size = 0
+
+#         handles = []
+#         for _, group in bucket_to_tensors.items():
+#             flat = torch._utils._flatten_dense_tensors(group)
+#             handle = dist.all_reduce(flat, dist.ReduceOp.SUM, async_op=True)
+#             handles.append(handle)
+#             torch._utils._unflatten_dense_tensors(flat, group)
+
+
+#         # for p in self.model.parameters():
+#         #     if p.grad is not None:
+#         #         dist.all_reduce(p.grad, dist.ReduceOp.SUM)
+            
+#         torch.cuda.synchronize()
+#         time_comm = time.monotonic() - t0
+#         total_mb = total_bytes // (1024 * 1024)
+#         logger.info(f"buckets {len(bucket_to_tensors)}, total MB {total_mb}, {total_mb / time_comm} MB / s")
+#         return time_comm
 
 
 class Trainer:
@@ -87,6 +143,16 @@ class Trainer:
         )
         self.model.to(self.cfg.trainer.device)
         self.model.compile()
+
+        self.is_distributed = dist.is_initialized()
+        if self.is_distributed:
+            self.model = DDP(self.model)
+            self.world_size = dist.get_world_size()
+            self.rank = dist.get_rank()
+        else:
+            self.world_size = 1
+            self.rank = 0
+
         if load_components == "all":
             self._init_optimizers()
 
@@ -96,6 +162,8 @@ class Trainer:
                 self.cfg.data.context_length,
                 torch.device(self.cfg.trainer.device),
                 self.cfg.data.seed,
+                world_size=self.world_size,
+                rank=self.rank
             )
             self.val_dataset = MemoryMappedDataset(
                 self.cfg.data.validation_path,
@@ -106,7 +174,9 @@ class Trainer:
             self.save_dir = Path(self.cfg.trainer.save_dir)
             self.save_dir.mkdir(exist_ok=True, parents=True)
         else:
+            self.model.eval()
             self.optimizers = None
+
         self.iteration = 0
         self.wandb = wandb
         load_from = load_from or self.cfg.trainer.load_from
@@ -121,6 +191,31 @@ class Trainer:
         self.tokenizer = PreTrainedTokenizerFast.from_pretrained(tokenizer_path)
         self.eos_token_id = list(self.tokenizer.added_tokens_decoder)[0]
         self.mbbp_evaluator = SimpleMBPPEvaluator(dataset="lite", timeout=8.0)
+
+        # Use per token bytes length for normalization in loss
+        # self.id2byte_len = torch.tensor(
+        #     [
+        #         len(self.tokenizer.decode([i], clean_up_tokenization_spaces=False).encode("utf-8"))
+        #         for i in range(self.tokenizer.vocab_size)
+        #     ],
+        #     device=self.cfg.trainer.device,
+        # )
+        self.id2byte_len = None
+        # these are needed for fair comparison with non-superbpe
+        if "superbpe" in self.cfg.data.tokenizer_path:
+            self.train_loss_multiplier = 0.7985
+            self.val_loss_multiplier = 0.8013
+        else:
+            self.train_loss_multiplier = 1
+            self.val_loss_multiplier = 1
+
+    @property
+    def rank_zero_only(self):
+        target_log_rank = 0
+        for i in range(self.world_size):
+            if "RTX 5090" in torch.cuda.get_device_name(i):
+                target_log_rank = i
+        return not self.is_distributed or (self.is_distributed and self.rank == target_log_rank)
 
     def _init_optimizers(self):
         if self.cfg.optim.use_muon:
@@ -189,17 +284,18 @@ class Trainer:
         save_checkpoint(
             self.save_dir / f"{self.iteration}.pt",
             self.cfg,
-            self.model,
+            self.model.module if self.is_distributed else self.model,
             self.optimizers,
             self.iteration,
         )
 
     def log(self, **data):
-        for k, v in data.items():
-            if "log" not in k:
-                logger.info(f"{k}: {v}")
-        if self.wandb is not None:
-            self.wandb.log(data)
+        if self.rank_zero_only:
+            for k, v in data.items():
+                if "log" not in k:
+                    logger.info(f"{k}: {v}")
+            if self.wandb is not None:
+                self.wandb.log(data)
 
     def generate(
         self,
@@ -208,6 +304,7 @@ class Trainer:
         top_p: float = 1.0,
         temperature: float = 0.0,
         max_steps: int = 256,
+        eos_prob_multiplier: float = 1.0,
     ):
         """
         Perform decoding with nucleous sampling and temperature
@@ -222,7 +319,7 @@ class Trainer:
             eos_prob_multiplier=eos_prob_multiplier,
         )
         decoded = self.tokenizer.decode(generated[0].cpu().tolist())
-        return decoded
+        return decoded, eos_probs
 
     def validate(self):
         mem("before validation")
@@ -239,18 +336,19 @@ class Trainer:
                 torch.autocast("cuda", enabled=self.cfg.trainer.dtype == "bfloat16"),
             ):
                 logits, _ = self.model(inputs)
-                val_loss, _ = cross_entropy(logits, targets)
+                val_loss, _ = cross_entropy(logits, targets, weight=None, per_token_byte_lengths=self.id2byte_len)
+                val_loss *= self.val_loss_multiplier
                 val_loss_epoch += val_loss.to(torch.float32)
                 val_iters += 1
         mem("after validation")
         val_loss_epoch = (val_loss_epoch / val_iters).item()
 
-        metrics = self.mbbp_evaluator.evaluate_with_generate(self.generate_fn, num_samples=1, mode="full")
-        logger.info(metrics)
+        # metrics = self.mbbp_evaluator.evaluate_with_generate(self.generate, num_samples=1, mode="full")
+        # logger.info(metrics)
 
         return {
             "val_loss": val_loss_epoch,
-            "val_perplexity": 2**val_loss_epoch,
+            "val_perplexity": 2.71828 ** val_loss_epoch,
             # "mbpp_lite_pass_1": metrics["pass_at_k"]["base"]["pass@1"]
         }
 
@@ -312,19 +410,35 @@ class Trainer:
         z_loss_weight = self.cfg.trainer.z_loss_weight
 
         with torch.autocast("cuda", enabled=self.cfg.trainer.dtype == "bfloat16"):
-            logits, prenorm_activation_norms = self.model(inputs)
-            loss, z_loss = cross_entropy(logits, targets)
+            logits, avg_kurtosis_values = self.model(inputs)
+            # using bits-per-bytes formulation of loss
+            loss, z_loss = cross_entropy(logits, targets, weight=None, per_token_byte_lengths=self.id2byte_len)
+            loss *= self.train_loss_multiplier
+            z_loss *= self.train_loss_multiplier
         if self.cfg.trainer.gradient_accumulation_steps > 1:
             loss /= self.cfg.trainer.gradient_accumulation_steps
             z_loss /= self.cfg.trainer.gradient_accumulation_steps
 
-        if self.cfg.trainer.dtype == "bfloat16":
-            self.scaler.scale(loss + z_loss_weight * z_loss).backward()
-        else:
-            (loss + z_loss_weight * z_loss).backward()
+        loss_for_backward = loss + z_loss_weight * z_loss
+
+        if self.is_distributed:
+            coef = (self.train_dataset.local_batch_size / self.cfg.data.batch_size)
+            loss_for_backward *= coef
+
+        context = self.model.no_sync() if self.is_distributed else nullcontext()
+        with context:
+            if self.cfg.trainer.dtype == "bfloat16":
+                self.scaler.scale(loss_for_backward).backward()
+            else:
+                loss_for_backward.backward()
 
         update_ratio = 0.0
+        time_comm = 0.0
         if self.iteration % self.cfg.trainer.gradient_accumulation_steps == 0:
+            # DDP
+            if self.is_distributed:
+                time_comm = self.model.finish_gradient_synchronization()
+
             if self.cfg.trainer.dtype == "bfloat16":
                 for opt in self.optimizers:
                     self.scaler.unscale_(opt)
@@ -352,8 +466,9 @@ class Trainer:
             "grad_norm": grad_norm,
             "learning_rate": iter_lr,
             "update_ratio": update_ratio,
-            "prenorm_activation_norms": prenorm_activation_norms,
+            "avg_kurtosis": avg_kurtosis_values,
             "parameter_norms": parameter_norms,
+            "time_comm": time_comm,
         }
         if iter_wd is not None:
             log["wd"] = iter_wd
@@ -364,7 +479,7 @@ class Trainer:
             "train_loss": step_stats["train_loss"].item(),
             "z_loss": step_stats["z_loss"].item(),
             "grad_norm": step_stats["grad_norm"].item(),
-            "prenorm_activation_norms": step_stats["prenorm_activation_norms"].cpu().tolist(),
+            "avg_kurtosis": step_stats["avg_kurtosis"].cpu().tolist(),
             "parameter_norms": {k: v.item() for k, v in step_stats["parameter_norms"].items()},
         }
         # take any other key as it is
@@ -373,21 +488,22 @@ class Trainer:
     def train(self):
         logger.info("Starting training loop")
         while self.iteration < self.cfg.trainer.max_steps:
-            if self.iteration % self.cfg.trainer.save_every == 0:
-                self.save_state()
-            if self.iteration > 0 and self.iteration % self.cfg.trainer.val_every == 0:
-                val_metrics = self.validate()
-                self.log(**val_metrics)
+            if self.rank_zero_only:
+                if self.iteration % self.cfg.trainer.save_every == 0:
+                    self.save_state()
+                if self.iteration > 0 and self.iteration % self.cfg.trainer.val_every == 0:
+                    val_metrics = self.validate()
+                    self.log(**val_metrics)
 
             inputs, targets = self.train_dataset.get_batch(self.cfg.data.batch_size)
             t0 = time.monotonic()
             step_stats = self.train_step(inputs, targets)
             t1 = time.monotonic()
-            if self.iteration % self.cfg.trainer.log_every == 0:
+            if self.iteration % self.cfg.trainer.log_every == 0 and self.rank_zero_only:
                 logger.info(f"Train iteration {self.iteration}")
                 # call item and introduce sync
                 step_stats = self.postprocess_step_stats(step_stats)
-                prenorm_log = {f"log/block{i}_prenorm": v for i, v in enumerate(step_stats["prenorm_activation_norms"])}
+                kurtosis_log = {f"log/block{i}_kurtosis": v for i, v in enumerate(step_stats["avg_kurtosis"])}
                 pnorm_log = {f"log/{k}_norm": v for k, v in step_stats["parameter_norms"].items()}
                 self.log(
                     **{
@@ -399,12 +515,14 @@ class Trainer:
                         "train/update_ratio": step_stats["update_ratio"],
                         "train/step": self.iteration,
                         "train/step_time": t1 - t0,
+                        "train/step_comm_time": step_stats["time_comm"],
                         "train/tokens_processed": self.tokens_processed,
-                        **prenorm_log,
+                        **kurtosis_log,
                         **pnorm_log,
                     }
                 )
             self.iteration += 1
-        self.save_state()
-        val_metrics = self.validate()
-        self.log(**val_metrics)
+        if self.rank_zero_only:
+            self.save_state()
+            val_metrics = self.validate()
+            self.log(**val_metrics)
