@@ -9,6 +9,7 @@ from sample_efficient_gpt.transformer.core import Linear, softmax
 from sample_efficient_gpt.transformer.rope import RotatyPositionalEmbedding
 from sample_efficient_gpt.transformer.triton_flash_attn import TritonFlashAttnFunc
 from sample_efficient_gpt.transformer.triton_flash_attn_qknorm import TritonFlashAttnQKNormFunc
+from sample_efficient_gpt.utils.profiling import nvtx_range
 
 
 class SelfDotProductAttnQKNorm(nn.Module):
@@ -100,9 +101,13 @@ class MultiHeadSelfAttention(nn.Module):
             elif self.gating == "per-head":
                 # gating single scalar per head
                 self.attn_gate = Linear(d_model, n_heads, device=device, dtype=dtype)
+            elif self.gating == "per-head-hd":
+                # gating single scalar per head
+                self.attn_gate = Linear(d_model // n_heads, n_heads, device=device, dtype=dtype)
             else:
                 raise ValueError(f"{self.gating=} is undefined")
 
+    @nvtx_range("attention")
     def forward(
         self,
         x: Float[Tensor, "b seq d"],
@@ -114,8 +119,7 @@ class MultiHeadSelfAttention(nn.Module):
         Q = rearrange(Q, "b seq (h head_d) -> (h b) seq head_d", h=self.n_heads)
         K = rearrange(K, "b seq (h head_d) -> (h b) seq head_d", h=self.n_heads)
 
-        # with nvtx.range("RoPE"):
-        with torch.autocast("cuda", enabled=False):
+        with torch.autocast("cuda", enabled=False), nvtx_range("RoPE"):
             Q = self.rope(Q, token_positions)
             K = self.rope(K, token_positions)
 
@@ -144,6 +148,14 @@ class MultiHeadSelfAttention(nn.Module):
             elif self.gating == "per-head":
                 # apply gating (single scalar per each head)
                 gate: Float[Tensor, "b seq h 1"] = self.attn_gate(x).sigmoid().unsqueeze(-1)
+                attn: Float[Tensor, "b seq h head_d"] = rearrange(
+                    attn, "(h b) seq head_d -> b seq h head_d", h=self.n_heads
+                )
+                attn_cat = rearrange(gate * attn, "b seq h head_d -> b seq (h head_d)", h=self.n_heads)
+            elif self.gating == "per-head-hd":
+                # apply gating (single scalar per each head)
+                head_dim = Q.shape[-1]
+                gate: Float[Tensor, "b seq h 1"] = self.attn_gate(x[..., :head_dim]).sigmoid().unsqueeze(-1)
                 attn: Float[Tensor, "b seq h head_d"] = rearrange(
                     attn, "(h b) seq head_d -> b seq h head_d", h=self.n_heads
                 )

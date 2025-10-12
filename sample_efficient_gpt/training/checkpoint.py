@@ -14,6 +14,7 @@ def save_checkpoint(
     model: nn.Module,
     optimizers: list[Optimizer],
     iteration: int = 0,
+    run_id: str | None = None,
 ):
     torch.save(
         {
@@ -21,6 +22,7 @@ def save_checkpoint(
             "model": model.state_dict(),
             "optimizer": [optimizer.state_dict() for optimizer in optimizers],
             "iteration": iteration,
+            "run_id": run_id,
         },
         fpath,
     )
@@ -32,5 +34,5 @@ def load_checkpoint(fpath: Path, model: nn.Module, optimizers: list[Optimizer] |
     if optimizers is not None:
         # for muon we load 2 optimizers
         for opt, opt_sd in zip(optimizers, checkpoint["optimizer"]):
-            opt.load_state_dict(checkpoint["optimizer"])
+            opt.load_state_dict(opt_sd)
     return checkpoint["iteration"]

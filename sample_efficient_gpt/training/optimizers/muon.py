@@ -1,8 +1,9 @@
 import torch
 from torch import Tensor
-import torch.cuda.nvtx as nvtx
+from typing import Any
 
 from sample_efficient_gpt.training.optimizers.muon_triton import newton_schulz_triton
+from sample_efficient_gpt.utils.profiling import nvtx_range
 
 # -----------------------------------------------------------------------------
 # Muon optimizer
@@ -33,9 +34,9 @@ class Muon(torch.optim.Optimizer):
             param_groups.append(dict(params=group_params))
         super().__init__(param_groups, defaults)
 
-    # @nvtx.range("muon step")
+    @nvtx_range("muon step")
     @torch.no_grad()
-    def step(self):
+    def step(self, closure: Any | None = None):
         for group in self.param_groups:
             params: list[Tensor] = group["params"]
             momentum = group["momentum"]

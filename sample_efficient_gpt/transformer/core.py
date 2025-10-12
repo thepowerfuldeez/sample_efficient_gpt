@@ -4,6 +4,8 @@ from torch import Tensor
 from jaxtyping import Float, Int
 from einops import einsum
 
+from sample_efficient_gpt.utils.profiling import nvtx_range
+
 
 class Linear(nn.Module):
     def __init__(self, in_features: int, out_features: int, device=None, dtype=None):
@@ -19,6 +21,7 @@ class Linear(nn.Module):
         sigma: float = 1.0 / (in_features**0.5)
         nn.init.trunc_normal_(self.weight, std=sigma, a=-3 * sigma, b=3 * sigma)
 
+    @nvtx_range("linear forward")
     def forward(self, x: Float[Tensor, "batch ... in_features"]) -> Float[Tensor, "batch ... out_features"]:
         # x is row-wise vector
         out: Float[Tensor, "batch ... out_features"] = einsum(
@@ -42,7 +45,6 @@ class Embedding(nn.Module):
         return torch.index_select(self.weight, dim=0, index=x.reshape(-1)).view(*x.size(), -1)
 
 
-# @nvtx.range("rmsnorm")
 class RMSNorm(nn.Module):
     def __init__(self, d_model: int, eps: float = 1e-5, position: int | None = None, device=None, dtype=None):
         """
@@ -53,6 +55,7 @@ class RMSNorm(nn.Module):
         self.eps = eps
         self.position = position
 
+    @nvtx_range("rmsnorm forward")
     def forward(self, x: Float[Tensor, "... d_model"]) -> Float[Tensor, "... d_model"]:
         """
         x is an activation from residual stream
@@ -78,6 +81,7 @@ class SwiGLU(nn.Module):
         self.up = Linear(d_model, d_ff * 2, device, dtype)
         self.down = Linear(d_ff, d_model, device, dtype)
 
+    @nvtx_range("swiglu forward")
     def forward(self, x: Float[Tensor, "... d_model"]) -> Float[Tensor, "... d_model"]:
         projected: Float[Tensor, "... 2*d_ff"] = self.up(x)
         left, right = projected.chunk(2, dim=-1)

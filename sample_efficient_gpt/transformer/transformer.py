@@ -4,10 +4,11 @@ from torch import Tensor
 from jaxtyping import Float, Int
 from tqdm.auto import tqdm
 
+import torch.distributed as dist
+
 from sample_efficient_gpt.transformer.core import SwiGLU, RMSNorm, Embedding, Linear, softmax
 from sample_efficient_gpt.transformer.attention import MultiHeadSelfAttention
-import torch.cuda.nvtx as nvtx
-import torch.distributed as dist
+from sample_efficient_gpt.utils.profiling import nvtx_range
 
 _MAX_SEQ_LEN = 4096
 
@@ -129,9 +130,9 @@ class Transformer(nn.Module):
         )
         v1 = None
         for i, layer in enumerate(self.blocks):
-            # with nvtx.range(f"block {i}"):
-            # pass residual value
-            x, avg_kurtosis, v = layer(x, v1=v1)
+            with nvtx_range(f"block {i}"):
+                # pass residual value
+                x, avg_kurtosis, v = layer(x, v1=v1)
             if v1 is None:
                 v1 = v
             avg_kurtosis_values[i] = avg_kurtosis
@@ -185,11 +186,10 @@ class Transformer(nn.Module):
         v1 = None
         for i, layer in enumerate(self.blocks):
             # pass residual value
-            with nvtx.range(f"block {i}"):
-                x, prenorm_act_norm, v = layer(x, v1=v1)
-                if v1 is None:
-                    v1 = v
-                prenorm_activation_norms[i] = prenorm_act_norm
+            x, prenorm_act_norm, v = layer(x, v1=v1)
+            if v1 is None:
+                v1 = v
+            prenorm_activation_norms[i] = prenorm_act_norm
         x = self.final_norm(x)
         return self.lm_head(x), prenorm_activation_norms
 

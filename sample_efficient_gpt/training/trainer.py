@@ -28,7 +28,7 @@ from sample_efficient_gpt.config_schema import Config
 from sample_efficient_gpt.utils.logger import logger
 from sample_efficient_gpt.utils.config_tools import load_config, apply_overrides
 
-from sample_efficient_gpt.training.ddp import DDP
+from sample_efficient_gpt.training.distributed import DDP, ShardedOptimizer
 from sample_efficient_gpt.tokenizer import Tokenizer
 from sample_efficient_gpt.evals.mbpp_eval import SimpleMBPPEvaluator
 
@@ -41,58 +41,6 @@ def mem(tag):
     resv = torch.cuda.memory_reserved() / 1e9
     logger.info(f"{tag}: allocated={alloc:.2f} GB, reserved={resv:.2f} GB")
 
-
-# class DDP:
-#     def __init__(self, module):
-#         self.module = module
-
-#     def forward(self, *args, **kwargs):
-#         return self.module(*args, **kwargs)
-
-#     def finish_gradient_synchronization(self) -> float:
-#         torch.cuda.synchronize()
-#         t0 = time.monotonic()
-
-#         groups = {}
-#         for n, p in list(self.module.named_parameters())[::-1]:
-#             if p.grad is not None:
-#                 g = p.grad
-#                 groups.setdefault(g.dtype, []).append(g)
-
-#         total_bytes = 0
-#         bucket_to_tensors = {}
-#         cur_bucket_id = -1
-#         # 250 MB buckets
-#         bucket_size = 250 * 1024 * 1024
-#         for dt, group in groups.items():
-#             cur_bucket_size = 0
-#             cur_bucket_id += 1
-#             for g in group:
-#                 tensor_bytes = g.numel() * g.itemsize
-#                 total_bytes += tensor_bytes
-#                 cur_bucket_size += tensor_bytes
-#                 bucket_to_tensors.setdefault(cur_bucket_id, []).append(g)
-#                 if cur_bucket_size > bucket_size:
-#                     cur_bucket_id += 1
-#                     cur_bucket_size = 0
-
-#         handles = []
-#         for _, group in bucket_to_tensors.items():
-#             flat = torch._utils._flatten_dense_tensors(group)
-#             handle = dist.all_reduce(flat, dist.ReduceOp.SUM, async_op=True)
-#             handles.append(handle)
-#             torch._utils._unflatten_dense_tensors(flat, group)
-
-
-#         # for p in self.model.parameters():
-#         #     if p.grad is not None:
-#         #         dist.all_reduce(p.grad, dist.ReduceOp.SUM)
-            
-#         torch.cuda.synchronize()
-#         time_comm = time.monotonic() - t0
-#         total_mb = total_bytes // (1024 * 1024)
-#         logger.info(f"buckets {len(bucket_to_tensors)}, total MB {total_mb}, {total_mb / time_comm} MB / s")
-#         return time_comm
 
 
 class Trainer:
@@ -163,7 +111,7 @@ class Trainer:
                 torch.device(self.cfg.trainer.device),
                 self.cfg.data.seed,
                 world_size=self.world_size,
-                rank=self.rank
+                rank=self.rank,
             )
             self.val_dataset = MemoryMappedDataset(
                 self.cfg.data.validation_path,
@@ -208,6 +156,13 @@ class Trainer:
         else:
             self.train_loss_multiplier = 1
             self.val_loss_multiplier = 1
+
+        logger.info(
+            f"Init [rank={self.rank}]: max_steps={self.cfg.trainer.max_steps}, start_iter={self.iteration}, "
+            f"val_every={self.cfg.trainer.val_every}, save_every={self.cfg.trainer.save_every}, "
+            f"world_size={self.world_size}, grad_accum={self.cfg.trainer.gradient_accumulation_steps}, "
+            f"batch_size={self.cfg.data.batch_size}",
+        )
 
     @property
     def rank_zero_only(self):
@@ -277,7 +232,12 @@ class Trainer:
 
     def load_state(self, path: Path):
         logger.info(f"Loading state from {str(path)}")
-        self.iteration = load_checkpoint(path, self.model, self.optimizers, device=self.cfg.trainer.device)
+        self.iteration = load_checkpoint(
+            path,
+            self.model.module if self.is_distributed else self.model,
+            self.optimizers,
+            device=self.cfg.trainer.device,
+        )
 
     def save_state(self):
         logger.info(f"Saving training state at iter={self.iteration}")
@@ -286,7 +246,8 @@ class Trainer:
             self.cfg,
             self.model.module if self.is_distributed else self.model,
             self.optimizers,
-            self.iteration,
+            iteration=self.iteration,
+            run_id=self.wandb.id if self.wandb is not None else None,
         )
 
     def log(self, **data):
@@ -295,7 +256,7 @@ class Trainer:
                 if "log" not in k:
                     logger.info(f"{k}: {v}")
             if self.wandb is not None:
-                self.wandb.log(data)
+                self.wandb.log(data, step=self.iteration)
 
     def generate(
         self,
@@ -321,11 +282,18 @@ class Trainer:
         decoded = self.tokenizer.decode(generated[0].cpu().tolist())
         return decoded, eos_probs
 
+    @property
+    def current_device(self):
+        if self.is_distributed:
+            return self.model.module.embedding.weight.data.device
+        else:
+            return self.model.embedding.weight.data.device
+
     def validate(self):
         mem("before validation")
         self.model.eval()
         val_iters = 0
-        val_loss_epoch = torch.zeros((), device=self.model.embedding.weight.data.device, dtype=torch.float32)
+        val_loss_epoch = torch.zeros((), device=self.current_device, dtype=torch.float32)
         for inputs, targets in tqdm(
             self.val_dataset.get_iterator(self.cfg.data.val_batch_size),
             total=len(self.val_dataset) // (self.cfg.data.val_batch_size * self.cfg.data.context_length),
@@ -348,7 +316,7 @@ class Trainer:
 
         return {
             "val_loss": val_loss_epoch,
-            "val_perplexity": 2.71828 ** val_loss_epoch,
+            "val_perplexity": 2.71828**val_loss_epoch,
             # "mbpp_lite_pass_1": metrics["pass_at_k"]["base"]["pass@1"]
         }
 
@@ -401,7 +369,7 @@ class Trainer:
                 pg["lr"] = iter_lr
                 if iter_wd is not None:
                     pg["wd"] = iter_wd
-        return iter_lr, iter_wd
+        return iter_lr, iter_wd if iter_wd is not None else self.cfg.optim.muon_wd
 
     def train_step(self, inputs, targets):
         self.model.train()
@@ -422,7 +390,7 @@ class Trainer:
         loss_for_backward = loss + z_loss_weight * z_loss
 
         if self.is_distributed:
-            coef = (self.train_dataset.local_batch_size / self.cfg.data.batch_size)
+            coef = self.train_dataset.local_batch_size / self.cfg.data.batch_size
             loss_for_backward *= coef
 
         context = self.model.no_sync() if self.is_distributed else nullcontext()

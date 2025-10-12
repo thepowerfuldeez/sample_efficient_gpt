@@ -34,6 +34,7 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--train-path", type=str, required=True)
     p.add_argument("--validation-path", type=str, required=True)
+    p.add_argument("--load-from", type=str, help='resume ckpt', default=None)
     p.add_argument("--override", type=str, help='{"k": "v"} override to the cfg as dict')
     p.add_argument("--config", type=str, default="gpt_small_faster", help="config path, default: gpt_small_faster")
     p.add_argument("--world-size", type=int, default=1)
@@ -76,10 +77,11 @@ def train(rank, cfg: Config, args):
         run = wandb.init(project=cfg.project, name=run_name, config=dataclass_to_nested_dict(cfg))
     else:
         run = None
-    trainer = Trainer(cfg, wandb=run)
+    trainer = Trainer(cfg, load_from=args.load_from, wandb=run)
     trainer.train()
 
-    run.finish()
+    if (args.world_size > 1 and rank == 2) or (args.world_size == 1 and rank == 0):
+        run.finish()
     if args.world_size > 1:
         shutdown()
 

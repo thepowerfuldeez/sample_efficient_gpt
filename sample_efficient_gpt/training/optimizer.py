@@ -6,6 +6,8 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
+from sample_efficient_gpt.utils.profiling import nvtx_range
+
 
 class SGD(torch.optim.Optimizer):
     def __init__(self, params, lr: float = 1e-4):
@@ -38,7 +40,7 @@ class AdamW(torch.optim.Optimizer):
     ):
         super().__init__(params=params, defaults=dict(lr=lr, betas=betas, weight_decay=weight_decay, eps=eps))
 
-    # @nvtx.range("adamw step")
+    @nvtx_range("adamw step")
     def step(self, closure: Any | None = None):
         loss = None if closure is None else closure()
         total_update_sq, total_weight_sq = 0.0, 0.0
@@ -124,7 +126,7 @@ def get_wsd_lr(t: int, lr_max: float, lr_min: float, warmup_steps: int, stable_s
         return (1 - (t - warmup_steps - stable_steps) / decay_steps) * (lr_max - lr_min)
 
 
-# @nvtx.range("clip grad")
+@nvtx_range("clip grad")
 def clip_grad_norm_(params: Iterable[nn.Parameter], max_grad_norm: float = 1.0, eps: float = 1e-8) -> Tensor:
     """
     Clips gradients to `max_grad_norm` in-place
