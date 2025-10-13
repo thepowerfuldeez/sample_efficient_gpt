@@ -121,5 +121,6 @@ class DDP(nn.Module):
         self.handles.clear()
 
         end.record()
+        end.synchronize()
         time_comm = start.elapsed_time(end) * 1e3
         return time_comm
