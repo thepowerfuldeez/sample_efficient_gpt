@@ -42,7 +42,6 @@ def mem(tag):
     logger.info(f"{tag}: allocated={alloc:.2f} GB, reserved={resv:.2f} GB")
 
 
-
 class Trainer:
     """
     class that takes cfg: Config and runs training
@@ -94,7 +93,6 @@ class Trainer:
 
         self.is_distributed = dist.is_initialized()
         if self.is_distributed:
-            self.model = DDP(self.model)
             self.world_size = dist.get_world_size()
             self.rank = dist.get_rank()
         else:
@@ -124,6 +122,9 @@ class Trainer:
         else:
             self.model.eval()
             self.optimizers = None
+
+        if self.is_distributed:
+            self.model = DDP(self.model)
 
         self.iteration = 0
         self.wandb = wandb
@@ -173,6 +174,15 @@ class Trainer:
         return not self.is_distributed or (self.is_distributed and self.rank == target_log_rank)
 
     def _init_optimizers(self):
+        optimizer_kwargs = dict(
+            lr=self.cfg.optim.lr,
+            betas=self.cfg.optim.betas,
+            weight_decay=self.cfg.optim.wd,
+        )
+        if self.cfg.optim.use_lion:
+            optimizer_cls = Lion
+        else:
+            optimizer_cls = AdamW
         if self.cfg.optim.use_muon:
             one_d_params = [
                 p for n, p in self.model.named_parameters() if p.ndim < 2 or "embedding" in n or "lm_head" in n
@@ -188,20 +198,13 @@ class Trainer:
                 for n, p in self.model.named_parameters()
                 if p.ndim >= 2 and "embedding" not in n and "lm_head" not in n
             ]
-            if self.cfg.optim.use_lion:
-                self.optimizer1 = Lion(
-                    one_d_params,
-                    lr=self.cfg.optim.lr,
-                    betas=self.cfg.optim.betas,
-                    weight_decay=self.cfg.optim.wd,
-                )
+
+            one_d_optimizer_kwargs = optimizer_kwargs
+            if self.is_distributed:
+                self.optimizer1 = ShardedOptimizer(one_d_params, optimizer_cls, **one_d_optimizer_kwargs)
             else:
-                self.optimizer1 = AdamW(
-                    one_d_params,
-                    lr=self.cfg.optim.lr,
-                    betas=self.cfg.optim.betas,
-                    weight_decay=self.cfg.optim.wd,
-                )
+                self.optimizer1 = optimizer_cls(one_d_params, **one_d_optimizer_kwargs)
+
             if self.cfg.optim.muon_lr is None:
                 muon_lr = self.cfg.optim.lr
             else:
@@ -210,20 +213,23 @@ class Trainer:
                 muon_wd = self.cfg.optim.wd
             else:
                 muon_wd = self.cfg.optim.muon_wd
-            self.optimizer2 = Muon(
-                two_d_params,
+
+            two_d_optimizer_kwargs = dict(
                 lr=muon_lr,
                 momentum=self.cfg.optim.betas[0],
                 weight_decay=muon_wd,
             )
+
+            if self.is_distributed:
+                self.optimizer2 = ShardedOptimizer(two_d_params, Muon, **two_d_optimizer_kwargs)
+            else:
+                self.optimizer2 = Muon(two_d_params, **two_d_optimizer_kwargs)
             self.optimizers = [self.optimizer1, self.optimizer2]
         else:
-            self.optimizer = AdamW(
-                self.model.parameters(),
-                lr=self.cfg.optim.lr,
-                betas=self.cfg.optim.betas,
-                weight_decay=self.cfg.optim.wd,
-            )
+            if self.is_distributed:
+                self.optimizer = ShardedOptimizer(one_d_params, optimizer_cls, **optimizer_kwargs)
+            else:
+                self.optimizer = optimizer_cls(one_d_params, **one_d_optimizer_kwargs)
             self.optimizers = [self.optimizer]
 
     @property
@@ -250,8 +256,8 @@ class Trainer:
             run_id=self.wandb.id if self.wandb is not None else None,
         )
 
-    def log(self, **data):
-        if self.rank_zero_only:
+    def log(self, data, rank_zero=True):
+        if (not rank_zero) or self.rank_zero_only:
             for k, v in data.items():
                 if "log" not in k:
                     logger.info(f"{k}: {v}")
@@ -377,6 +383,10 @@ class Trainer:
 
         z_loss_weight = self.cfg.trainer.z_loss_weight
 
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+
         with torch.autocast("cuda", enabled=self.cfg.trainer.dtype == "bfloat16"):
             logits, avg_kurtosis_values = self.model(inputs)
             # using bits-per-bytes formulation of loss
@@ -399,6 +409,10 @@ class Trainer:
                 self.scaler.scale(loss_for_backward).backward()
             else:
                 loss_for_backward.backward()
+
+        # TODO: this will block execution of cuda stream so remove when not needed
+        end.record()
+        end.synchronize()
 
         update_ratio = 0.0
         time_comm = 0.0
@@ -437,6 +451,7 @@ class Trainer:
             "avg_kurtosis": avg_kurtosis_values,
             "parameter_norms": parameter_norms,
             "time_comm": time_comm,
+            f"rank_{self.rank}_fwd_bwd": start.elapsed_time(end) / 1e3,
         }
         if iter_wd is not None:
             log["wd"] = iter_wd
@@ -461,20 +476,20 @@ class Trainer:
                     self.save_state()
                 if self.iteration > 0 and self.iteration % self.cfg.trainer.val_every == 0:
                     val_metrics = self.validate()
-                    self.log(**val_metrics)
+                    self.log(val_metrics)
 
             inputs, targets = self.train_dataset.get_batch(self.cfg.data.batch_size)
             t0 = time.monotonic()
-            step_stats = self.train_step(inputs, targets)
+            raw_step_stats = self.train_step(inputs, targets)
             t1 = time.monotonic()
             if self.iteration % self.cfg.trainer.log_every == 0 and self.rank_zero_only:
                 logger.info(f"Train iteration {self.iteration}")
                 # call item and introduce sync
-                step_stats = self.postprocess_step_stats(step_stats)
+                step_stats = self.postprocess_step_stats(raw_step_stats)
                 kurtosis_log = {f"log/block{i}_kurtosis": v for i, v in enumerate(step_stats["avg_kurtosis"])}
                 pnorm_log = {f"log/{k}_norm": v for k, v in step_stats["parameter_norms"].items()}
                 self.log(
-                    **{
+                    {
                         "train/loss": step_stats["train_loss"],
                         "train/z_loss": step_stats["z_loss"],
                         "train/grad_norm": step_stats["grad_norm"],
@@ -489,8 +504,12 @@ class Trainer:
                         **pnorm_log,
                     }
                 )
+                # rank fwd_bwd time on each rank
+                self.log(
+                    {f"train/rank_{self.rank}_fwd_bwd_time": raw_step_stats[f"rank_{self.rank}_fwd_bwd"]}, rank_zero=False
+                )
             self.iteration += 1
         if self.rank_zero_only:
             self.save_state()
             val_metrics = self.validate()
-            self.log(**val_metrics)
+            self.log(val_metrics)

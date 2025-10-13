@@ -66,7 +66,7 @@ class DDP(nn.Module):
     def _hook(self, bucket_idx: int, param_name: str, p: Tensor) -> None:
         """
         Main backward hook with future that would unflatten the param group
-        We would construct param group determenisticaly by name until order matches 1-1
+        We would construct param group deterministicaly by name until order matches 1-1
         """
         if p.grad is not None and self._should_all_reduce:
             g = p.grad
@@ -113,11 +113,13 @@ class DDP(nn.Module):
         return self.module(*args, **kwargs)
 
     def finish_gradient_synchronization(self) -> float:
-        t0 = time.monotonic()
+        start, end = torch.cuda.Event(True), torch.cuda.Event(True)
+        start.record()
 
         for h in self.handles:
             h.wait()
         self.handles.clear()
 
-        time_comm = time.monotonic() - t0
+        end.record()
+        time_comm = start.elapsed_time(end) * 1e3
         return time_comm
