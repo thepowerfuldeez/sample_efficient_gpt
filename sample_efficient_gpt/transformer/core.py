@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 from jaxtyping import Float, Int
-from einops import einsum
 
 from sample_efficient_gpt.utils.profiling import nvtx_range
 
@@ -14,21 +13,17 @@ class Linear(nn.Module):
         out_features: final dim of the output
         """
         super().__init__()
-        weight: Tensor = torch.empty(out_features, in_features, device=device, dtype=dtype)
-        self.weight: Float[Tensor, "out_features in_features"] = nn.Parameter(weight)
+        self.linear = nn.Linear(in_features, out_features, bias=False, device=device, dtype=dtype)
+
         # std: float = 2.0 / (in_features + out_features)
         # in muP we use different parametrization
         sigma: float = 1.0 / (in_features**0.5)
-        nn.init.trunc_normal_(self.weight, std=sigma, a=-3 * sigma, b=3 * sigma)
+        nn.init.trunc_normal_(self.linear.weight, std=sigma, a=-3 * sigma, b=3 * sigma)
 
     @nvtx_range("linear forward")
     def forward(self, x: Float[Tensor, "batch ... in_features"]) -> Float[Tensor, "batch ... out_features"]:
-        # x is row-wise vector
-        out: Float[Tensor, "batch ... out_features"] = einsum(
-            x,
-            self.weight,
-            "batch ... in_features, out_features in_features -> batch ... out_features",
-        )
+        out: Float[Tensor, "batch ... out_features"] = self.linear(x)
+
         return out
 
 
