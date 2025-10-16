@@ -42,7 +42,7 @@ class Embedding(nn.Module):
         nn.init.trunc_normal_(self.weight, std=sigma, a=-3 * sigma, b=3 * sigma)
 
     def forward(self, x: Int[Tensor, "batch seq_len"]) -> Float[Tensor, "batch seq_len d_model"]:
-        return torch.index_select(self.weight, dim=0, index=x.reshape(-1)).view(*x.size(), -1)
+        return torch.nn.functional.embedding(x, self.weight)
 
 
 class RMSNorm(nn.Module):
@@ -53,7 +53,12 @@ class RMSNorm(nn.Module):
         super().__init__()
         self.gain = nn.Parameter(torch.ones(d_model, device=device, dtype=dtype))
         self.eps = eps
-        self.position = position
+        if position is None:
+            scale = torch.tensor(1.0, device=device, dtype=torch.float32)
+        else:
+            # rsqrt(position) as float tensor
+            scale = torch.rsqrt(torch.tensor(float(position), device=device, dtype=torch.float32))
+        self.register_buffer("position_scale", scale, persistent=False)
 
     @nvtx_range("rmsnorm forward")
     def forward(self, x: Float[Tensor, "... d_model"]) -> Float[Tensor, "... d_model"]:
@@ -65,9 +70,8 @@ class RMSNorm(nn.Module):
         with torch.autocast("cuda", enabled=False):
             reverse_rms: Float[Tensor, "... 1"] = torch.rsqrt((x * x).mean(-1) + self.eps).unsqueeze(-1)
             out: Tensor = x * reverse_rms * self.gain
-        # apply layernorm scaling
-        if self.position is not None:
-            out.mul_(torch.rsqrt(torch.tensor(self.position, device=out.device)))
+        # apply layernorm scaling if enabled
+        out.mul_(self.position_scale)
         return out.to(in_dtype)
 
 
