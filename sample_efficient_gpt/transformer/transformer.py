@@ -7,7 +7,7 @@ from tqdm.auto import tqdm
 import torch.distributed as dist
 
 from sample_efficient_gpt.transformer.core import SwiGLU, RMSNorm, Embedding, Linear, softmax
-from sample_efficient_gpt.transformer.attention import MultiHeadSelfAttention
+from sample_efficient_gpt.transformer.attention import MultiHeadSelfAttention, KVCache
 from sample_efficient_gpt.utils.profiling import nvtx_range
 
 _MAX_SEQ_LEN = 4096
@@ -48,9 +48,10 @@ class Block(nn.Module):
         x: Float[Tensor, "b seq d_model"],
         token_positions: Int[Tensor, "b seq"] | None = None,
         v1: Tensor | None = None,
+        kv_cache: KVCache | None = None,
     ) -> Float[Tensor, "b seq d_model"]:
         assert v1 is None or (v1 is not None and (v1.device == x.device))
-        attn_out, v = self.attn(self.ln1(x), token_positions, v1=v1)
+        attn_out, v = self.attn(self.ln1(x), token_positions, v1=v1, kv_cache=kv_cache)
         # prenorm_act_norm = x.detach().pow(2).mean(dim=-1).sqrt().mean()
         # kurtosis
         x_f = x.detach().to(torch.float32)
@@ -101,6 +102,7 @@ class Transformer(nn.Module):
     ):
         super().__init__()
         self.embedding = Embedding(vocab_size, d_model, device, dtype)
+        self.n_layers = n_layers
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -123,7 +125,7 @@ class Transformer(nn.Module):
         if weight_tying:
             self.lm_head.weight = self.embedding.weight
 
-    def forward(self, x: Int[Tensor, "bs seq"]) -> Float[Tensor, "bs seq vocab_size"]:
+    def forward(self, x: Int[Tensor, "bs seq"], kv_cache: list[KVCache] | None = None) -> Float[Tensor, "bs seq vocab_size"]:
         x: Float[Tensor, "bs seq d_model"] = self.embedding(x)
         avg_kurtosis_values: Float[Tensor, "n_layers"] = torch.zeros(
             (len(self.blocks),), dtype=x.dtype, device=x.device
@@ -132,7 +134,7 @@ class Transformer(nn.Module):
         for i, layer in enumerate(self.blocks):
             with nvtx_range(f"block {i}"):
                 # pass residual value
-                x, avg_kurtosis, v = layer(x, v1=v1)
+                x, avg_kurtosis, v = layer(x, v1=v1, kv_cache=kv_cache[i] if kv_cache is not None else None)
             if v1 is None:
                 v1 = v
             avg_kurtosis_values[i] = avg_kurtosis
@@ -153,30 +155,40 @@ class Transformer(nn.Module):
 
         returns generated sampled token ids + EOS probs at each step for debugging
         """
-        input_seq = prompt
+        kv_cache = [KVCache() for _ in range(self.n_layers)]
+        input_seq = prompt.clone()
+        output_seq = prompt
+        eos_probs = None
         with torch.inference_mode():
             for _ in tqdm(range(max_steps)):
                 logits: Float[Tensor, "bs seq vocab"]
-                logits, _ = self.forward(input_seq)
+                logits, _ = self.forward(input_seq, kv_cache=kv_cache)
                 all_probs = softmax(logits, dim=-1, temperature=temperature)
+                last_prob: Float[Tensor, "bs vocab"] = all_probs[:, -1, :]
                 if temperature == 0:
-                    out: Int[Tensor, "bs"] = torch.argmax(all_probs[:, -1, :], dim=-1, keepdim=True)
+                    out: Int[Tensor, "bs"] = torch.argmax(last_prob, dim=-1, keepdim=True)
                 else:
-                    probs: Float[Tensor, "bs vocab"] = all_probs[:, -1, :]
-                    probs[:, eos_token_id] *= eos_prob_multiplier
+                    last_prob[:, eos_token_id] *= eos_prob_multiplier
                     # nucleous sampling
                     if top_p < 1.0:
-                        sorted_values, sorted_idx = probs.sort(-1, descending=True)
+                        sorted_values, sorted_idx = last_prob.sort(-1, descending=True)
                         mask = sorted_values.cumsum(-1) <= top_p
                         mask[:, 0] = True
-                        new_probs_mask = torch.zeros_like(probs, dtype=torch.bool).scatter_(-1, sorted_idx, mask)
-                        probs = probs * new_probs_mask
-                        probs = probs / probs.sum(-1, keepdim=True)
-                    out: Int[Tensor, "bs"] = torch.multinomial(probs, 1)
-                input_seq = torch.cat([input_seq, out], dim=-1)
-                if (out[-1:] == eos_token_id).all(dim=-1).item():
+                        new_probs_mask = torch.zeros_like(last_prob, dtype=torch.bool).scatter_(-1, sorted_idx, mask)
+                        last_prob = last_prob * new_probs_mask
+                        last_prob = last_prob / last_prob.sum(-1, keepdim=True)
+                    out: Int[Tensor, "bs"] = torch.multinomial(last_prob, 1)
+                output_seq = torch.cat([output_seq, out], dim=-1)
+                input_seq = out
+                # input_seq = output_seq
+                last_prob_eos = last_prob[:, eos_token_id]
+                if eos_probs is None:
+                    eos_probs = last_prob_eos
+                else:
+                    eos_probs = torch.cat((eos_probs, last_prob_eos), dim=-1)
+                if (out == eos_token_id).all(dim=-1).item():
                     break
-        return input_seq, all_probs[:, :, eos_token_id]
+        return output_seq, eos_probs
 
     def forward_tp(self, x: Int[Tensor, "bs seq"]) -> Float[Tensor, "bs seq vocab_size"]:
         x: Float[Tensor, "bs seq d_model"] = self.embedding(x)

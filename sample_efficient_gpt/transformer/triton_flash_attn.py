@@ -10,9 +10,19 @@ torch.set_float32_matmul_precision("high")
 
 
 # fmt: off
+@triton.autotune(configs=[
+    triton.Config(kwargs={'Q_TILE_SIZE': 32, "K_TILE_SIZE": 32}, num_warps=8),
+    triton.Config(kwargs={'Q_TILE_SIZE': 64, "K_TILE_SIZE": 64}, num_warps=4),
+    triton.Config(kwargs={'Q_TILE_SIZE': 64, "K_TILE_SIZE": 64}, num_warps=2),
+    triton.Config(kwargs={'Q_TILE_SIZE': 128, "K_TILE_SIZE": 128}, num_warps=2),
+  ],
+  key=['Nq'] # the two above configs will be evaluated anytime
+                 # the value of x_size changes
+)
 @triton.jit
 def flashatt_kernel_fwd(q_ptr, k_ptr, v_ptr, z_ptr, l_ptr, 
                         Nq, Nk, scale,
+                        q_start,
                         D: tl.constexpr, 
                         Q_TILE_SIZE: tl.constexpr, 
                         K_TILE_SIZE: tl.constexpr, 
@@ -50,11 +60,11 @@ def flashatt_kernel_fwd(q_ptr, k_ptr, v_ptr, z_ptr, l_ptr,
     last_m = m
 
     # Nk_adj = (i * Q_TILE_SIZE / Nq * Nk) // K_TILE_SIZE * K_TILE_SIZE + 1
-    global_q_idx = q_idx + i * Q_TILE_SIZE
+    global_q_idx = q_start + i * Q_TILE_SIZE + q_idx
 
     # if j > i * Q_TILE_SIZE: skip that block
     if IS_CAUSAL:
-        end_idx = i * Q_TILE_SIZE + K_TILE_SIZE
+        end_idx = i * Q_TILE_SIZE + K_TILE_SIZE + q_start
     else:
         end_idx = Nk
 
@@ -195,6 +205,7 @@ def flashatt_kernel_bwd(q_ptr, k_ptr, v_ptr, z_ptr, l_ptr,
 
 # Optimal is q_tile / k_tile is (128, 64) for fwd and (32, 64) for bwd
 
+
 class TritonFlashAttnFunc(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -202,10 +213,14 @@ class TritonFlashAttnFunc(torch.autograd.Function):
         Q: Float[Tensor, "*Nq d"],
         K: Float[Tensor, "*Nk d"],
         V: Float[Tensor, "*Nk d"],
+        q_start: int = 0,
         is_causal: bool = True,
         q_tile: int = 64,
         k_tile: int = 64,
     ):
+        """
+        we use q_start for inference with k/v cache
+        """
         assert Q.is_cuda and Q.is_contiguous()
         assert K.is_cuda and K.is_contiguous()
         assert V.is_cuda and V.is_contiguous()
@@ -232,6 +247,7 @@ class TritonFlashAttnFunc(torch.autograd.Function):
             Nq,
             Nk,
             scale,
+            q_start,
             d,
             q_tile,
             k_tile,

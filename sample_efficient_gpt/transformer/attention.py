@@ -12,13 +12,28 @@ from sample_efficient_gpt.transformer.triton_flash_attn_qknorm import TritonFlas
 from sample_efficient_gpt.utils.profiling import nvtx_range
 
 
+class KVCache:
+    def __init__(self):
+        self.keys = None
+        self.values = None
+
+    def append(self, k: Float[Tensor, "bs seq d_model"], v: Float[Tensor, "bs seq d_model"]):
+        if self.keys is None:
+            self.keys = k
+            self.values = v
+        else:
+            self.keys = torch.cat((self.keys, k), dim=1)
+            self.values = torch.cat((self.values, v), dim=1)
+        return self.keys, self.values
+
+
 class SelfDotProductAttnQKNorm(nn.Module):
     def __init__(
         self,
         context_length: int,
     ):
         super().__init__()
-        self.gain = nn.Parameter(torch.log2(torch.tensor(context_length**2 - context_length)))
+        self.gain = nn.Parameter(torch.log2(torch.tensor([context_length**2 - context_length])))
 
     def forward(
         self,
@@ -26,8 +41,9 @@ class SelfDotProductAttnQKNorm(nn.Module):
         K: Float[Tensor, "... seq_len d_k"],
         V: Float[Tensor, "... seq_len d_k"],
         is_causal: bool = True,
+        q_start: int = 0,
     ) -> Float[Tensor, "... seq_len d_k"]:
-        return TritonFlashAttnQKNormFunc.apply(Q, K, V, self.gain, is_causal)
+        return TritonFlashAttnQKNormFunc.apply(Q, K, V, self.gain, is_causal, q_start)
 
 
 # Modification using regular RMSNorm with sqrt(d) scaling
@@ -82,15 +98,15 @@ class MultiHeadSelfAttention(nn.Module):
             self.sdpa_qknorm = SelfDotProductAttnQKNorm(d_model // n_heads)
         if value_residual:
             self.alpha1, self.alpha2 = (
-                nn.Parameter(torch.tensor(0.5, device=device)),
-                nn.Parameter(torch.tensor(0.5, device=device)),
+                nn.Parameter(torch.tensor([0.5], device=device)),
+                nn.Parameter(torch.tensor([0.5], device=device)),
             )
-            self.scale = nn.Parameter(torch.tensor(1.0, device=device))
+            self.scale = nn.Parameter(torch.tensor([1.0], device=device))
         else:
             self.alpha1, self.alpha2, self.scale = (
-                torch.tensor(1.0, device=device),
-                torch.tensor(0.0, device=device),
-                torch.tensor(1.0, device=device),
+                torch.tensor([1.0], device=device),
+                torch.tensor([0.0], device=device),
+                torch.tensor([1.0], device=device),
             )
 
         # elementwise SDPA gating on attention after concat
@@ -113,15 +129,27 @@ class MultiHeadSelfAttention(nn.Module):
         x: Float[Tensor, "b seq d"],
         token_positions: Int[Tensor, "b seq"] | None = None,
         v1: Tensor | None = None,
+        kv_cache: KVCache | None = None,
     ) -> Float[Tensor, "b seq d"]:
         Q, K, V = self.qkv(x).chunk(3, -1)
         seq_len = Q.size(1)
+        if kv_cache is not None:
+            past = kv_cache.keys.size(1) if kv_cache.keys is not None else 0
+            # we need to adjust position for Q when K seq is 1
+            pos = torch.arange(past, past + seq_len, device=Q.device, dtype=torch.long)
+            q_start = past
+        else:
+            pos = None
+            q_start = 0
         Q = rearrange(Q, "b seq (h head_d) -> (h b) seq head_d", h=self.n_heads)
         K = rearrange(K, "b seq (h head_d) -> (h b) seq head_d", h=self.n_heads)
 
         with torch.autocast("cuda", enabled=False), nvtx_range("RoPE"):
-            Q = self.rope(Q, token_positions)
-            K = self.rope(K, token_positions)
+            Q = self.rope(Q, pos)
+            K = self.rope(K, pos)
+
+        if kv_cache is not None:
+            K, V = kv_cache.append(K, V)
 
         V = rearrange(V, "b seq (h head_d) -> (h b) seq head_d", h=self.n_heads).contiguous()
         if v1 is None:
@@ -134,9 +162,9 @@ class MultiHeadSelfAttention(nn.Module):
         assert V1.is_contiguous()
         assert V.is_contiguous()
         if self.qknorm:
-            attn: Float[Tensor, "(h b) seq head_d"] = self.sdpa_qknorm(Q, K, V, True)
+            attn: Float[Tensor, "(h b) seq head_d"] = self.sdpa_qknorm(Q, K, V, True, q_start=q_start)
         else:
-            attn: Float[Tensor, "(h b) seq head_d"] = TritonFlashAttnFunc.apply(Q, K, V, True)
+            attn: Float[Tensor, "(h b) seq head_d"] = TritonFlashAttnFunc.apply(Q, K, V, True, q_start=q_start)
 
         if not self.gating:
             attn_cat = rearrange(attn, "(h b) seq head_d -> b seq (h head_d)", h=self.n_heads)

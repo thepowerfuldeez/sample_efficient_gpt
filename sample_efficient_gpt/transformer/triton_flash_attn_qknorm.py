@@ -24,6 +24,7 @@ torch.set_float32_matmul_precision("high")
 def flashatt_qknorm_kernel_fwd(q_ptr, k_ptr, v_ptr, scale_ptr, 
                         z_ptr, l_ptr, 
                         Nq, Nk,
+                        q_start,
                         D: tl.constexpr, 
                         Q_TILE_SIZE: tl.constexpr, 
                         K_TILE_SIZE: tl.constexpr, 
@@ -60,7 +61,7 @@ def flashatt_qknorm_kernel_fwd(q_ptr, k_ptr, v_ptr, scale_ptr,
     m = tl.full((Q_TILE_SIZE, 1), float("-inf"), dtype=tl.float32)
     last_m = m
 
-    global_q_idx = q_idx + i * Q_TILE_SIZE
+    global_q_idx = q_idx + i * Q_TILE_SIZE + q_start
 
     # q-norm
     qf = q_i.to(tl.float32)
@@ -69,9 +70,9 @@ def flashatt_qknorm_kernel_fwd(q_ptr, k_ptr, v_ptr, scale_ptr,
     # if j > i * Q_TILE_SIZE: skip that block
     if IS_CAUSAL:
         if Q_TILE_SIZE != K_TILE_SIZE:
-            end_idx = tl.minimum(Nk, (i + 1) * K_TILE_SIZE)
+            end_idx = tl.minimum(Nk, q_start + (i + 1) * Q_TILE_SIZE)
         else:
-            end_idx = i * Q_TILE_SIZE + K_TILE_SIZE
+            end_idx = i * Q_TILE_SIZE + K_TILE_SIZE + q_start
     else:
         end_idx = Nk
 
@@ -268,6 +269,7 @@ class TritonFlashAttnQKNormFunc(torch.autograd.Function):
         V: Float[Tensor, "*Nk d"],
         gain: Float[Tensor, "1"],
         is_causal: bool = True,
+        q_start: int = 0,
         q_tile: int = 64,
         k_tile: int = 64,
     ):
@@ -297,6 +299,7 @@ class TritonFlashAttnQKNormFunc(torch.autograd.Function):
             l_final,
             Nq,
             Nk,
+            q_start,
             d,
             # q_tile,
             # k_tile,
