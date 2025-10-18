@@ -15,26 +15,27 @@ class DDP(nn.Module):
 
         # p name -> bucket_idx
         self.buckets_map = {}
-        if dist.is_initialized():
-            cur_bucket_id = 0
-            cur_bucket_size = 0
-            prev_dt = None
+        assert dist.is_initialized()
+        cur_bucket_id = 0
+        cur_bucket_size = 0
+        prev_dt = None
 
-            for n, p in list(self.module.named_parameters())[::-1]:
-                dist.broadcast(p.data, src=0)
+        for n, p in list(self.module.named_parameters())[::-1]:
+            dist.broadcast(p.data, src=0)
 
-                if p.is_leaf and p.requires_grad:
-                    tensor_bytes = p.data.numel() * p.data.element_size()
+            if p.is_leaf and p.requires_grad:
+                tensor_bytes = p.data.numel() * p.data.element_size()
 
-                    dt = p.data.dtype
-                    # start new bucket if dtype changes or size would overflow
-                    if (prev_dt is not None and dt != prev_dt) or cur_bucket_size + tensor_bytes > self.bucket_size:
-                        cur_bucket_id += 1
-                        cur_bucket_size = 0
+                dt = p.data.dtype
+                # start new bucket if dtype changes or size would overflow
+                if (prev_dt is not None and dt != prev_dt) or cur_bucket_size + tensor_bytes > self.bucket_size:
+                    cur_bucket_id += 1
+                    cur_bucket_size = 0
 
-                    cur_bucket_size += tensor_bytes
-                    self.buckets_map[n] = cur_bucket_id
-                    prev_dt = dt
+                cur_bucket_size += tensor_bytes
+                self.buckets_map[n] = cur_bucket_id
+                prev_dt = dt
+        assert len(self.buckets_map)
 
         # bucket ix -> param names
         self.bucket_to_names = {}
@@ -87,9 +88,10 @@ class DDP(nn.Module):
                 group = self.buckets.pop(bucket_idx)
                 self.buckets[bucket_idx] = [None for _ in range(len(group))]
                 flat = torch._utils._flatten_dense_tensors(group)
-                handle = dist.all_reduce(flat, dist.ReduceOp.SUM, async_op=True)
+                handle = dist.all_reduce(flat.bfloat16(), dist.ReduceOp.SUM, async_op=True)
 
-                def _on_finish(_):
+                def _on_finish(_, flat=flat, group=group):
+                    flat = flat.to(group[0].dtype)
                     torch._utils._unflatten_dense_tensors(flat, group)
                     # print(f"[rank={dist.get_rank()}] hook is completed with {bucket_idx=}, bucket idx in self.buckets: {bucket_idx in self.buckets}")
 
@@ -113,14 +115,14 @@ class DDP(nn.Module):
         return self.module(*args, **kwargs)
 
     def finish_gradient_synchronization(self) -> float:
-        start, end = torch.cuda.Event(True), torch.cuda.Event(True)
-        start.record()
+        t0 = time.monotonic()
 
         for h in self.handles:
             h.wait()
         self.handles.clear()
 
-        end.record()
-        end.synchronize()
-        time_comm = start.elapsed_time(end) * 1e3
+        time_comm = time.monotonic() - t0
+        # speed = (self.total_bytes / (1024 * 1024)) / time_comm
+        # print(f"total bytes: {self.total_bytes}, communication speed {speed} GB / s")
+        self.total_bytes = 0
         return time_comm
