@@ -14,7 +14,7 @@ import numpy as np
 import regex as re
 from tqdm.auto import tqdm
 
-from sample_efficient_gpt.pretokenization import find_chunk_boundaries
+from sample_efficient_gpt.tokenizer.pretokenization import find_chunk_boundaries
 
 # PAT = re.compile(r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""")
 # upgraded pattern with digits grouping

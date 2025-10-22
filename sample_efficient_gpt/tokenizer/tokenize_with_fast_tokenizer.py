@@ -9,14 +9,15 @@ import numpy as np
 import regex as re
 from tqdm.auto import tqdm
 
-from sample_efficient_gpt.pretokenization import find_chunk_boundaries
-
 import pyarrow.compute as pc
 from transformers import PreTrainedTokenizerFast
-from datasets import Dataset, load_dataset
+from datasets import Dataset, load_dataset, disable_caching
+
+from sample_efficient_gpt.tokenizer.pretokenization import find_chunk_boundaries
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+disable_caching()
 
 
 class TokenizerProcessor:

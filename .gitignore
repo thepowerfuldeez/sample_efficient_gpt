@@ -10,6 +10,7 @@ data_tokenized/
 **/.DS_Store
 node_modules/
 **/fastsplit/target
+**/rustbpe/target
 *.egg-info*
 **/data_tokenized
 wandb/

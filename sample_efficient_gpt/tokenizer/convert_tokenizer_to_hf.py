@@ -11,7 +11,7 @@ from tokenizers.processors import ByteLevel as ByteLevelProc
 from transformers import PreTrainedTokenizerFast
 
 
-from sample_efficient_gpt.tokenizer import Tokenizer as RefTokenizer
+from sample_efficient_gpt.tokenizer.tokenizer import Tokenizer as RefTokenizer
 
 
 def parse_args():

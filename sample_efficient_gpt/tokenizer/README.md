@@ -1,3 +1,9 @@
+### Quickstart
+
+Look into train.sh commands for a full flow
+
+
+
 ### Speed profiling
 ```bash
 sudo py-spy record -f speedscope -o profile.json -- python bpe1.py

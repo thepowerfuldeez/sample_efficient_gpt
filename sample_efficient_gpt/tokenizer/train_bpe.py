@@ -12,7 +12,7 @@ import regex as re
 import numpy as np
 from tqdm.auto import tqdm
 
-from sample_efficient_gpt.pretokenization import Splitter, pre_tokenize, find_chunk_boundaries
+from sample_efficient_gpt.tokenizer.pretokenization import Splitter, pre_tokenize, find_chunk_boundaries
 
 logging.basicConfig(level=os.getenv("LOGLEVEL", logging.INFO))
 logger = logging.getLogger(__name__)
@@ -338,7 +338,7 @@ class BPE:
             i += 1
         return tuple(new_k), updated_indices
 
-    def train(self, filepath: str, num_processes: int = 1):
+    def train(self, filepath: str, num_processes: int = 1, use_rust_bpe: bool = True):
         logger.info("Starting to train BPE")
         t0 = time.monotonic()
         pre_token_counts = pre_tokenize(self.splitter, str(filepath), num_processes=num_processes)
@@ -354,16 +354,35 @@ class BPE:
         n_iters = max(0, self.vocab_size - self.cur_vocab_size)
         logger.info(f"Using {n_iters=}")
 
-        # Non-efficient implementation
-        # for i in range(n_iters):
-        #     (updated_key, new_id), self.pre_token_byte_counts = self.iter_merge(self.pre_token_byte_counts)
-        #     self.new_id_to_bytes[new_id] = updated_key
-        #     v = self.convert(new_id)
-        #     self.merges.append(updated_key)
-        #     converted = (self.convert(updated_key[0]), self.convert(updated_key[1]))
-        #     merges_tuples.append(converted)
-        #     self.vocab[new_id] = v
-        #     logger.info(f"iter: {i}, updated new id mapping with {new_id=}, {v=}")
+        if use_rust_bpe:
+            from rustbpe import Tokenizer as RustBPE
+
+            # convert to [(bytes, count)]
+            pre_tokens = [(k.encode("utf-8"), v) for k, v in pre_token_counts.items()]
+            # the Rust side counts only base+merges; specials are added below in Python
+            target_vocab_no_specials = self.vocab_size - len(self.special_tokens)
+            assert target_vocab_no_specials >= 256
+            rtok = RustBPE()
+            rtok.train_from_pretokens(pre_tokens, target_vocab_no_specials)
+            merges_bytes = rtok.export_merges_bytes()  # list[(left_bytes, right_bytes)]
+
+            # Rebuild vocab in your exact layout: bytes, specials, then merges in order
+            vocab = {i: bytes([i]) for i in range(256)}
+            for i, s in enumerate(self.special_tokens_bytes):
+                vocab[256 + i] = s
+            next_id = 256 + len(self.special_tokens_bytes)
+
+            merges_tuples = []
+            for l, r in merges_bytes:
+                vocab[next_id] = l + r
+                merges_tuples.append((l, r))
+                next_id += 1
+
+            self.vocab = vocab
+            self.merges_tuples = merges_tuples
+            # (optional) persist every save_every iters if you want partial checkpoints of just 'merges_tuples'
+            self.save()
+            return self.vocab, self.merges_tuples
 
         # cached, more efficient version
         updated_keys, all_counts, pair_to_pre_tokens, all_updated_pairs = None, None, None, None
@@ -604,12 +623,26 @@ def parse_args():
     p.add_argument("--resume-from-vocab", default="")
     p.add_argument("--resume-from-merges", default="")
     p.add_argument("--superbpe", type=int, default=0)
+    p.add_argument("--use-rust-bpe", type=int, default=0)
     return p.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    bpe = BPE(["<|endoftext|>"], vocab_size=args.vocab_size, save_every=args.save_every, save_dir=args.save_dir)
+    special_tokens = [
+        "<|endoftext|>",
+
+        # for SFT
+        "<|user_start|>", # user messages
+        "<|user_end|>",
+        "<|assistant_start|>", # assistant messages
+        "<|assistant_end|>",
+        "<|python_start|>", # assistant invokes python REPL tool
+        "<|python_end|>",
+        "<|output_start|>", # python REPL outputs back to assistant
+        "<|output_end|>",
+    ]
+    bpe = BPE(special_tokens, vocab_size=args.vocab_size, save_every=args.save_every, save_dir=args.save_dir)
     # bpe = BPE(["<|endoftext|>"], vocab_size=10000)
     # bpe = BPE(["<|endoftext|>"], vocab_size=1000)
 
@@ -622,7 +655,7 @@ if __name__ == "__main__":
             superbpe=args.superbpe == 1,
         )
     else:
-        vocab, merges = bpe.train(args.data_path, num_processes=args.num_processes)
+        vocab, merges = bpe.train(args.data_path, num_processes=args.num_processes, use_rust_bpe=args.use_rust_bpe == 1)
 
     # logger.info([bpe.decode(x) for x in list(vocab)[256:356]])
     # toks = bpe.encode("newest is a newest")
