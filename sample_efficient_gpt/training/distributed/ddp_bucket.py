@@ -8,10 +8,10 @@ from torch import Tensor
 
 
 class DDP(nn.Module):
-    def __init__(self, module, bucket_size_mb: float = 50):
+    def __init__(self, module, bucket_size_mb: float = 9.7):
         super().__init__()
         self.module = module
-        self.bucket_size = bucket_size_mb * 1024 * 1024
+        self.bucket_size = int(bucket_size_mb * 1024 * 1024)
 
         # p name -> bucket_idx
         self.buckets_map = {}
@@ -22,19 +22,19 @@ class DDP(nn.Module):
 
         for n, p in list(self.module.named_parameters())[::-1]:
             dist.broadcast(p.data, src=0)
+            if not (p.is_leaf and p.requires_grad):
+                continue
+            tensor_bytes = p.data.numel() * p.data.element_size()
 
-            if p.is_leaf and p.requires_grad:
-                tensor_bytes = p.data.numel() * p.data.element_size()
+            dt = p.data.dtype
+            # start new bucket if dtype changes or size would overflow
+            if (prev_dt is not None and dt != prev_dt) or cur_bucket_size + tensor_bytes > self.bucket_size:
+                cur_bucket_id += 1
+                cur_bucket_size = 0
 
-                dt = p.data.dtype
-                # start new bucket if dtype changes or size would overflow
-                if (prev_dt is not None and dt != prev_dt) or cur_bucket_size + tensor_bytes > self.bucket_size:
-                    cur_bucket_id += 1
-                    cur_bucket_size = 0
-
-                cur_bucket_size += tensor_bytes
-                self.buckets_map[n] = cur_bucket_id
-                prev_dt = dt
+            cur_bucket_size += tensor_bytes
+            self.buckets_map[n] = cur_bucket_id
+            prev_dt = dt
         assert len(self.buckets_map)
 
         # bucket ix -> param names
@@ -63,6 +63,7 @@ class DDP(nn.Module):
         self.buckets = {
             bucket_idx: [None for _ in range(len(names))] for bucket_idx, names in self.bucket_to_names.items()
         }
+        self.comm_stream = torch.cuda.Stream()
 
     def _hook(self, bucket_idx: int, param_name: str, p: Tensor) -> None:
         """
@@ -84,17 +85,20 @@ class DDP(nn.Module):
             # )
 
             # no more None left
-            if len([x for x in self.buckets[bucket_idx] if x is None]) == 0:
+            bucket_is_full = not [x for x in self.buckets[bucket_idx] if x is None]
+            if bucket_is_full:
                 group = self.buckets.pop(bucket_idx)
                 self.buckets[bucket_idx] = [None for _ in range(len(group))]
                 flat = torch._utils._flatten_dense_tensors(group)
-                handle = dist.all_reduce(flat.bfloat16(), dist.ReduceOp.SUM, async_op=True)
+                ready = torch.cuda.Event()
+                torch.cuda.current_stream().record_event(ready)
+                with torch.cuda.stream(self.comm_stream):
+                    self.comm_stream.wait_event(ready)
+                    handle = dist.all_reduce(flat.bfloat16(), dist.ReduceOp.SUM, async_op=True)
 
-                def _on_finish(_, flat=flat, group=group):
-                    flat = flat.to(group[0].dtype)
-                    torch._utils._unflatten_dense_tensors(flat, group)
-                    # print(f"[rank={dist.get_rank()}] hook is completed with {bucket_idx=}, bucket idx in self.buckets: {bucket_idx in self.buckets}")
-
+                    def _on_finish(_, flat=flat, group=group):
+                        flat = flat.to(group[0].dtype)
+                        torch._utils._unflatten_dense_tensors(flat, group)
                 handle.get_future().then(_on_finish)
                 # print(
                 #     f"[rank={dist.get_rank()}] grad shape {g.shape} flat shape {flat.shape}, sending all reduce with bucket {bucket_idx}, "
