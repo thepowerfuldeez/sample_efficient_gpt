@@ -7,8 +7,8 @@ from einops import einsum, rearrange
 
 from sample_efficient_gpt.transformer.core import Linear, softmax
 from sample_efficient_gpt.transformer.rope import RotatyPositionalEmbedding
-from sample_efficient_gpt.transformer.triton_flash_attn import TritonFlashAttnFunc
-from sample_efficient_gpt.transformer.triton_flash_attn_qknorm import TritonFlashAttnQKNormFunc
+from sample_efficient_gpt.transformer.ops.triton_flash_attn import TritonFlashAttnFunc
+from sample_efficient_gpt.transformer.ops.triton_flash_attn_qknorm import TritonFlashAttnQKNormFunc
 from sample_efficient_gpt.utils.profiling import nvtx_range
 
 
