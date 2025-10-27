@@ -270,8 +270,6 @@ class TritonFlashAttnQKNormFunc(torch.autograd.Function):
         gain: Float[Tensor, "1"],
         is_causal: bool = True,
         q_start: int = 0,
-        q_tile: int = 64,
-        k_tile: int = 64,
     ):
         assert Q.is_cuda and Q.is_contiguous()
         assert K.is_cuda and K.is_contiguous()
@@ -301,15 +299,13 @@ class TritonFlashAttnQKNormFunc(torch.autograd.Function):
             Nk,
             q_start,
             d,
-            # q_tile,
-            # k_tile,
             IS_CAUSAL=is_causal,
         )
         ctx.is_causal = is_causal
         ctx.save_for_backward(l_final, Q, K, V, gain, out_final)
         return out_final
 
-    def backward(ctx, grad_output, q_tile: int = 64, k_tile: int = 64):
+    def backward(ctx, grad_output):
         L, Q, K, V, gain, O = ctx.saved_tensors
         bs, Nq, d = Q.shape
         Nk = K.shape[1]
@@ -343,8 +339,6 @@ class TritonFlashAttnQKNormFunc(torch.autograd.Function):
             Nq,
             Nk,
             D=d,
-            # Q_TILE_SIZE=q_tile,
-            # K_TILE_SIZE=k_tile,
             IS_CAUSAL=ctx.is_causal,
         )
         return dQ, dK, dV, dg, None, None, None

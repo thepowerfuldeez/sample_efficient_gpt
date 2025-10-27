@@ -84,7 +84,7 @@ class SwiGLU(nn.Module):
     def forward(self, x: Float[Tensor, "... d_model"]) -> Float[Tensor, "... d_model"]:
         projected: Float[Tensor, "... 2*d_ff"] = self.up(x)
         left, right = projected.chunk(2, dim=-1)
-        return self.down(left * torch.sigmoid(left) * right)
+        return self.down(torch.nn.functional.silu(left) * right)
 
 
 def softmax(x: Tensor, dim: int = 0, temperature: float = 1.0) -> Tensor:
