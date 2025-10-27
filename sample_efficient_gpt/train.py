@@ -18,14 +18,6 @@ from sample_efficient_gpt.utils.config_tools import apply_overrides
 BACKEND = "nccl"
 
 
-def setup(rank, world_size):
-    os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = "29500"
-    if BACKEND != "gloo":
-        torch.cuda.set_device(f"cuda:{rank}")
-    dist.init_process_group(BACKEND, rank=rank, world_size=world_size)
-
-
 def shutdown():
     dist.destroy_process_group()
 
@@ -42,11 +34,10 @@ def parse_args():
 
 
 def train(rank, cfg: Config, args):
-    if args.world_size > 1:
-        setup(rank, args.world_size)
-
     if args.override:
         override = json.loads(args.override)
+        if "optim.seesaw_steps" in override:
+            override['optim.seesaw_steps'] = eval(override['optim.seesaw_steps'])
     else:
         override = {}
     s = ""
@@ -89,14 +80,10 @@ def train(rank, cfg: Config, args):
 if __name__ == "__main__":
     args = parse_args()
     if args.world_size > 1:
-        mp.spawn(
-            train,
-            args=(
-                cfg,
-                args,
-            ),
-            nprocs=args.world_size,
-            join=True,
-        )
+        dist.init_process_group(BACKEND)
+        if BACKEND != "gloo":
+            rank = dist.get_rank()
+            torch.cuda.set_device(f"cuda:{rank}")
+        train(rank, cfg, args)
     else:
         train(0, cfg, args)

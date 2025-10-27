@@ -3,7 +3,7 @@ name = "sample_efficient_gpt"
 version = "1.0.5"
 description = "CS336 Assignment 1"
 readme = "README.md"
-requires-python = "==3.13"
+requires-python = "==3.13.*"
 dependencies = [
     "einops>=0.8.1", # tensor operations
     "einx>=0.3.0", # more general tensor operations

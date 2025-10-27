@@ -14,6 +14,7 @@ Main achievements that makes this framework stand out across others:
 6. Z-loss (https://arxiv.org/pdf/2204.02311)
 7. muP parametrization (reference from https://arxiv.org/abs/2505.02222)
 8. SuperBPE tokenizer with the conversion to HF tokenizers (https://arxiv.org/abs/2503.13423)
+9. Individual WD for muP transfer + Cautious Weight Decay (https://arxiv.org/abs/2510.12402)
 
 
 Various optimization tricks, such as momentum warmup, WD schedule
@@ -57,8 +58,12 @@ You can modify k/v pairs in config with --override argument to `train.py`
 Note that you have to provide both train and validation datasets in tokenized format as npy files.
 
 ### To-do:
-* DDP
+* DDP (X)
 * FSDP
-* Evals
-* FP8 training
+* Evals (X)
+* FP8 training (+-)
 * MoE
+
+Not fully verified:
+- Seesaw schedule
+- Prodigy optimizer
