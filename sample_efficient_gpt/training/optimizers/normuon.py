@@ -10,6 +10,27 @@ from sample_efficient_gpt.utils.profiling import nvtx_range
 # Muon optimizer
 
 
+@torch.compile(dynamic=True)
+def normuon_update(p, v, second_momentum_buffer, eff_lr, eff_weight_decay, beta2):
+    ###################################
+    v_norm = v.norm(dim=(-2, -1), keepdim=True)
+    v_mean = (
+        torch.mean(v * v, dim=-1, keepdim=True) if p.size(-2) >= p.size(-1) else torch.mean(v * v, dim=-2, keepdim=True)
+    )
+    second_momentum_buffer.lerp_(v_mean, 1 - beta2)
+    step_size = torch.rsqrt(second_momentum_buffer.clamp_min(1e-10))
+    v.mul_(step_size)
+    v_norm_new = v.norm(dim=(-2, -1), keepdim=True).clamp_min(1e-10)
+    v.mul_(v_norm / v_norm_new)
+    ####################################
+
+    cautious_mask = torch.eq(torch.signbit(v), torch.signbit(p))
+    p.addcmul_(p, cautious_mask.to(p.dtype), value=-eff_weight_decay)
+
+    p.add_(other=v, alpha=-eff_lr)
+    return v_norm.squeeze()
+
+
 class Muon(torch.optim.Optimizer):
     """
     NorMuon - a variant of the Muon optimizer that introduces neuron-wise normalization to improve stability and convergence efficiency.
@@ -45,6 +66,7 @@ class Muon(torch.optim.Optimizer):
     @torch.no_grad()
     def step(self, closure: Any | None = None):
         update_rms = torch.tensor(0.0, dtype=torch.float32, device=self.param_groups[0]["params"][0].device)
+        n = 0
         for group in self.param_groups:
             params: list[Tensor] = group["params"]
             momentum = group["momentum"]
@@ -55,12 +77,16 @@ class Muon(torch.optim.Optimizer):
                     continue
 
                 # out_dim / inp_dim (reversed order bc in our implementation of Linear dims are swapped)
-                mup_mult = max(1, p.size(-2) / p.size(-1)) ** 0.5
+                mup_mult = max(1, p.size(0) / p.size(1)) ** 0.5
                 # variance preserving multiplier TODO: try on longer runs
                 # var_preserving_multiplier = 0.2 * max(p.size(-2), p.size(-1)) ** 0.5
                 var_preserving_multiplier = 1.0
+                assert hasattr(p, "lr_mul")
                 eff_lr = group["lr"] * mup_mult * var_preserving_multiplier * getattr(p, "lr_mul", 1.0)
+
+                # decoupled wd
                 eff_weight_decay = group["lr"] * group["weight_decay"] * getattr(p, "wd_mul", 1.0)
+
                 state = self.state[p]
 
                 if len(state) == 0:
@@ -73,28 +99,14 @@ class Muon(torch.optim.Optimizer):
                 momentum_buffer = state["momentum_buffer"]
                 second_momentum_buffer = state["second_momentum_buffer"]
 
-                # apply wd
-                p.mul_(1 - eff_weight_decay)
                 # interpolate momentum
                 momentum_buffer.lerp_(grad, 1 - momentum)
                 grad = grad.lerp_(momentum_buffer, momentum)
 
                 v = newton_schulz_triton(grad.bfloat16()).float()
 
-                ###################################
-                vnorm = v.norm(dim=(-2, -1), keepdim=True)
-                v_mean = (
-                    torch.mean(v * v, dim=-1, keepdim=True)
-                    if p.size(-2) >= p.size(-1)
-                    else torch.mean(v * v, dim=-2, keepdim=True)
-                )
-                second_momentum_buffer.lerp_(v_mean, 1 - beta2)
-                step_size = 1 / second_momentum_buffer.sqrt().clamp_min(1e-10)
-                v.mul_(step_size)
-                vnorm_new = v.norm(dim=(-2, -1), keepdim=True)
-                v.mul_(vnorm / (vnorm_new.clamp_min(1e-10)))
-                ####################################
-
-                p.add_(other=v, alpha=-eff_lr)
-                update_rms += (v * v).mean()
-        return update_rms.sqrt()
+                v_norm = normuon_update(p, v, second_momentum_buffer, eff_lr, eff_weight_decay, beta2)
+                # v_norm = normuon_triton_update(p, v, second_momentum_buffer, eff_lr, eff_weight_decay, beta2)
+                update_rms += v_norm * v_norm
+                n += 1
+        return update_rms.sqrt() / (n + 1e-10)

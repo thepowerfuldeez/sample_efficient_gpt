@@ -3,7 +3,7 @@ from typing import Literal
 from pathlib import Path
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=False)
 class DataConfig:
     train_path: str | Path = ""
     validation_path: str | Path = ""
@@ -20,7 +20,7 @@ class OptimConfig:
     wd: float = 1e-7
     betas: tuple[float, float] = (0.9, 0.99)
     lr_min_coeff: float = 1e-2
-    scheduler: str = "cosine"  # or "wsd"
+    scheduler: str = "cosine"  # or "wsd" or "seesaw"
     use_muon: bool = False
     use_lion: bool = False
     # if None then use lr / wd
@@ -29,8 +29,9 @@ class OptimConfig:
     muon_wd_min: float | None = None
     warmup_steps: int = 1000
     cosine_steps: int = 10_000
-    stable_steps: int = 10_000
-    decay_steps: int = 10_000
+    seesaw_steps: tuple[int] = tuple()
+    wsd_need_warmup: bool = True
+    wsd_phase: str = "stable"  # stable or decay
 
 
 @dataclass(frozen=True)
@@ -53,6 +54,7 @@ class TrainerConfig:
     load_from: str | None = None
     device: str = "cuda"
     dtype: Literal["float32", "bfloat16"] = "float32"
+    use_fp8: bool = False
     max_steps: int = 200_000
     z_loss_weight: float = 1e-4
     max_grad_norm: float = 1.0
@@ -66,6 +68,8 @@ class TrainerConfig:
     val_every: int = 100
     # log train metrics every n steps
     log_every: int = 10
+    # can be ddp or fsdp
+    dist_mode: str = "ddp"
 
 
 @dataclass(frozen=False)

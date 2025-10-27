@@ -1,5 +1,6 @@
 import math
-from typing import Any
+from typing import Any, Literal
+from bisect import bisect
 from collections.abc import Iterable
 
 import torch
@@ -43,7 +44,8 @@ class AdamW(torch.optim.Optimizer):
     @nvtx_range("adamw step")
     def step(self, closure: Any | None = None):
         loss = None if closure is None else closure()
-        total_update_sq, total_weight_sq = 0.0, 0.0
+        # total_update_sq, total_weight_sq = 0.0, 0.0
+        update_rms = torch.tensor(0.0, dtype=torch.float32, device=self.param_groups[0]["params"][0].device)
         for group in self.param_groups:
             lr = group["lr"]
             beta1, beta2 = group["betas"]
@@ -60,6 +62,9 @@ class AdamW(torch.optim.Optimizer):
                 v: Tensor = state.get("v", torch.zeros_like(p.data, requires_grad=False))
 
                 grad: Tensor = p.grad.data
+                if torch.isnan(grad).any():
+                    print(f"[t={t}] adamw grad is nan!", p)
+                    grad[torch.isnan(grad)] = 0.0
 
                 m: Tensor = beta1 * m + (1 - beta1) * grad
                 v: Tensor = beta2 * v + (1 - beta2) * torch.square(grad)
@@ -70,15 +75,16 @@ class AdamW(torch.optim.Optimizer):
                 adam_delta = -lr * bias_correction_term * m / (torch.sqrt(v) + eps)
                 delta = wd_delta + adam_delta
 
-                total_update_sq += (delta.float().norm() ** 2).item()
-                total_weight_sq += (p.data.float().norm() ** 2).item()
+                # total_update_sq += (delta.float().norm() ** 2).item()
+                # total_weight_sq += (p.data.float().norm() ** 2).item()
+
+                update_rms += (delta * delta).mean()
 
                 p.data.add_(delta)
                 state["t"] = t + 1
                 state["m"] = m
                 state["v"] = v
-        update_ratio = math.sqrt(total_update_sq) / (math.sqrt(total_weight_sq) + eps)
-        return (loss, update_ratio)
+        return update_rms.sqrt()
 
 
 def get_cosine_lr(t: int, lr_max: float, lr_min: float, warmup_steps: int, cosine_steps: int) -> float:
@@ -104,26 +110,49 @@ def get_cosine_lr(t: int, lr_max: float, lr_min: float, warmup_steps: int, cosin
         return lr_min
 
 
-def get_wsd_lr(t: int, lr_max: float, lr_min: float, warmup_steps: int, stable_steps: int, decay_steps: int) -> float:
+def get_wsd_lr(
+    t: int,
+    lr_max: float,
+    lr_min: float,
+    warmup_steps: int,
+    decay_steps: int,
+    start_decay_step: int,
+    need_warmup: bool = True,
+    wsd_phase: Literal["stable", "decay"] = "stable",
+) -> float:
     """
     Update learning rate based on Warmup Stable Decay schedule
 
     t: int - current step
     lr_max: float - max learning rate (usually set as original learning rate)
     lr_min: float - minimum learning rate after decay
+    need_warmup: bool = need warmup for this stable phase
     warmup_steps: int - warmup steps starting from ~0 (t / warmup_steps) * lr_max
-    stable_steps: int - total number of steps in the stable state [warmup_steps, decay_steps]
-    decay_steps: int - total number of steps in the decay state to lr_min [decay_steps, total_steps]
 
     Returns: updated lr
     """
+
+    if wsd_phase == "stable":
+        if need_warmup and t < warmup_steps:
+            return t / warmup_steps * lr_max
+        else:
+            return lr_max
+    else:
+        # 1-sqrt decay
+        return lr_min + (1 - math.sqrt((t - start_decay_step) / decay_steps)) * (lr_max - lr_min)
+
+
+def get_seesaw_lr(t: int, lr_max: float, warmup_steps: int, seesaw_steps: list[int]):
+    """
+    Simple stepwise lr where lr is multiplied by sqrt(2) each time
+    """
     if t < warmup_steps:
         return t / warmup_steps * lr_max
-    elif warmup_steps <= t < warmup_steps + stable_steps:
+    if t < seesaw_steps[0]:
         return lr_max
-    else:
-        # t >= warmup_steps + stable_steps
-        return (1 - (t - warmup_steps - stable_steps) / decay_steps) * (lr_max - lr_min)
+    # 2^-1 for first step, 2^-2 for second step etc
+    multiplier = 2 ** (-bisect(seesaw_steps, t) / 2)
+    return lr_max * multiplier
 
 
 @nvtx_range("clip grad")

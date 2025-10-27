@@ -89,7 +89,6 @@ class SwiGLU(nn.Module):
 
 def softmax(x: Tensor, dim: int = 0, temperature: float = 1.0) -> Tensor:
     o: Tensor = x - x.max(dim=dim, keepdim=True)[0]
-    assert temperature > 0, "temperature must be more than 0"
-    if temperature != 1.0:
+    if temperature != 0.0:
         o /= temperature
     return o.exp() / o.exp().sum(dim=dim, keepdim=True)
