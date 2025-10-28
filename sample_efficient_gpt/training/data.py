@@ -3,7 +3,9 @@ from collections.abc import Iterator
 from bisect import bisect
 
 import torch
+import torch.distributed as dist
 import numpy as np
+from numpy.lib.stride_tricks import sliding_window_view
 from jaxtyping import Int
 from torch import Tensor
 
@@ -29,25 +31,32 @@ class MemoryMappedDataset:
         Can also take only `rank` part of the batch for DDP training
         """
         path_or_ds = Path(path_or_ds)
+        total_length = 0
+        ds = []
+        lengths = [0]
         if path_or_ds.is_dir():
-            # dataset contains npz files
-            total_length = 0
-            ds = []
-            lengths = [0]
+            # dataset folder contains npy files
             for fp in sorted(path_or_ds.glob("*.npy")):
                 if "offsets_" in fp.name:
                     continue
-                ds_fp = self._read_file(fp)
-                l = ds_fp.shape[0]
+                arr = self._read_file(fp)
+                l = arr.shape[0]
                 total_length += l
                 lengths.append(total_length)
-                ds.append(ds_fp)
-            self.total_length = total_length
-            self.ds = ds
-            self.lengths = lengths
+                ds.append(arr)
         else:
-            self.ds = self._read_file(path_or_ds)
-            self.total_length = self.ds.shape[0]
+            arr = self._read_file(path_or_ds)
+            l = arr.shape[0]
+            lengths.append(total_length)
+            ds.append(arr)
+            total_length += l
+        self.total_length = total_length
+        self.ds = ds
+        self.lengths = lengths
+
+        # per-chunk window views for fast in-chunk slices
+        self.chunk_windows = [sliding_window_view(arr, context_length + 1) for arr in self.ds]
+
         logger.info(f"Dataset length: {self.total_length}")
         self.context_length = context_length
         self.device = device
@@ -60,55 +69,84 @@ class MemoryMappedDataset:
         self.rank = rank
         self.is_distributed = world_size > 1
         self.local_batch_size = None
+        self.N = self.total_length - self.context_length
 
     def _read_file(self, path):
         ds = np.load(path, mmap_mode="r")
         return ds
 
-    def __getitem__(self, i: int) -> tuple[Int[Tensor, "context"], Int[Tensor, "context"]]:
-        """
-        i can be anything from 0 to self.__len__
-        """
-        i_finish = i + self.context_length + 1
-        if isinstance(self.ds, list):
-            ds_chunk_left = bisect(self.lengths, i) - 1
-            ds_chunk_right = bisect(self.lengths, i_finish) - 1
-            if ds_chunk_left < ds_chunk_right:
-                # this means that data spans across multiple dataset chunks
-                chunk_start = self.ds[ds_chunk_left][(i - self.lengths[ds_chunk_left]) :].astype(np.int32)
-                # fmt: off
-                mid = [np.asaray(self.ds[ds_chunk_i]).astype(np.int32) 
-                       for ds_chunk_i in range(ds_chunk_left + 1, ds_chunk_right)]
-                if mid:
-                    chunk_mid = np.concat(mid)
-                # fmt: on
-                chunk_finish = self.ds[ds_chunk_right][: (i_finish - self.lengths[ds_chunk_right])].astype(np.int32)
-                chunk = np.concat([chunk_start, chunk_mid, chunk_finish] if mid else [chunk_start, chunk_finish])
-            else:
-                l = self.lengths[ds_chunk_left]
-                chunk = self.ds[ds_chunk_left][(i - l) : (i_finish - l)].astype(np.int32)
-        else:
-            chunk = self.ds[i:i_finish].astype(np.int32)
-        inputs = torch.from_numpy(chunk[:-1]).to(device=self.device)
-        targets = torch.from_numpy(chunk[1:]).to(device=self.device)
+    def _split_indices(self, starts: np.ndarray):
+        # find ds chunks
+        ds_left_chunks = np.searchsorted(self.lengths, starts, side="right") - 1
+        offs = starts - np.array(self.lengths, dtype=np.int64)[ds_left_chunks]
+        # Determine which ones stay within the same chunk
+        in_chunk = offs + (self.context_length + 1) <= np.array(
+            [self.ds[chunk_ind].shape[0] for chunk_ind in ds_left_chunks]
+        )
+        return ds_left_chunks, offs, in_chunk
+
+    def _gather_batch_numpy(self, starts: np.ndarray):
+        left_chunks, offs, in_chunk = self._split_indices(starts)
+
+        B = starts.shape[0]
+        context_span = self.context_length + 1
+        chunk = np.empty((B, context_span), dtype=np.int32)
+
+        # Fast path: windows entirely within a single chunk (vectorized per unique chunk)
+        for chunk_ind in np.unique(left_chunks[in_chunk]):
+            mask = (left_chunks == chunk_ind) & in_chunk
+            rows = np.nonzero(mask)[0]
+            chunk[rows] = self.chunk_windows[chunk_ind][offs[rows]]  # (rows, ctx+1)
+
+        # Slow path: windows crossing chunk boundary (rare): fill with two slices
+        cross_rows = np.nonzero(~in_chunk)[0]
+        for r in cross_rows:
+            c = left_chunks[r]
+            o = offs[r]
+            left_cap = self.ds[c].shape[0] - o
+            need = context_span
+            take_left = min(left_cap, need)
+            out = np.empty((context_span,), dtype=np.int32)
+            out[:take_left] = self.ds[c][o : o + take_left].astype(np.int32, copy=False)
+
+            rem = context_span - take_left
+            cc = c + 1
+            filled = take_left
+            while rem > 0 and cc < len(self.ds):
+                take = min(self.ds[cc].shape[0], rem)
+                out[filled : filled + take] = self.ds[cc][:take].astype(np.int32, copy=False)
+                rem -= take
+                filled += take
+                cc += 1
+            chunk[r] = out
+
+        inputs = chunk[:, :-1]
+        targets = chunk[:, 1:]
         return inputs, targets
 
     def __len__(self):
-        return self.total_length - self.context_length
+        return self.N
 
     def get_iterator(self, batch_size: int) -> Iterator[tuple[Int[Tensor, "bs context"], Int[Tensor, "bs context"]]]:
         """
         Return an iterator of batches in a sequential order
         Last batch is dropped
         """
-        sequential_indices = torch.arange(start=0, end=len(self), step=batch_size * self.context_length)
+        context_span = self.context_length + 1
+        sequential_indices = torch.arange(
+            start=0, end=self.N - batch_size * context_span, step=batch_size * context_span
+        )
+        assert len(self.ds) == 1, "Only validation is supported (len(ds) == 1)"
+        windows = self.chunk_windows[0]
         for i_start in sequential_indices:
-            batch_inputs = torch.empty((batch_size, self.context_length), device=self.device, dtype=torch.int32)
-            batch_targets = torch.empty((batch_size, self.context_length), device=self.device, dtype=torch.int32)
-            for sample_idx in range(batch_size):
-                inputs, targets = self.__getitem__(i_start.item() + sample_idx)
-                batch_inputs[sample_idx] = inputs
-                batch_targets[sample_idx] = targets
+            starts = torch.arange(i_start, i_start + batch_size * context_span, context_span).cpu().numpy()
+            # bs x context_span
+            chunk = windows[starts]
+            batch_inputs = chunk[:, :-1].astype(np.int32, copy=False)
+            batch_targets = chunk[:, 1:].astype(np.int32, copy=False)
+            batch_inputs, batch_targets = torch.from_numpy(batch_inputs), torch.from_numpy(batch_targets)
+            batch_inputs = batch_inputs.pin_memory().to(self.device, non_blocking=True)
+            batch_targets = batch_targets.pin_memory().to(self.device, non_blocking=True)
             yield batch_inputs, batch_targets
 
     def get_batch(self, batch_size: int) -> tuple[Int[Tensor, "bs context"], Int[Tensor, "bs context"]]:
@@ -119,7 +157,7 @@ class MemoryMappedDataset:
         """
         if self.is_distributed:
             # We want to split unevenly across workers
-            target_log_rank = 0
+            target_log_ranks = [0]
             small_batch_size = batch_size // self.world_size
             # Hack for GPUS which are uneven in their power
             gpu_names = [torch.cuda.get_device_name(i) for i in range(self.world_size)]
@@ -128,28 +166,24 @@ class MemoryMappedDataset:
                 and any(["RTX 5090" in s for s in gpu_names])
                 and any(["RTX 4090" in s for s in gpu_names])
             ):
-                for i in range(self.world_size):
-                    if "RTX 5090" in torch.cuda.get_device_name(i):
-                        target_log_rank = i
-                adj_n_chunks = 7
+                target_log_ranks = [i for i in range(self.world_size) if "RTX 5090" in gpu_names[i]]
+                adj_n_chunks = 8
                 small_batch_size = (batch_size // adj_n_chunks) * 2
                 large_batch_size = (batch_size // adj_n_chunks) * 3
-                local_batch_size = large_batch_size if self.rank == target_log_rank else small_batch_size
+                assert small_batch_size + 2 * large_batch_size == batch_size, "batch sizes don't match"
+                local_batch_size = large_batch_size if self.rank in target_log_ranks else small_batch_size
             else:
                 local_batch_size = small_batch_size
         else:
             local_batch_size = batch_size
         self.local_batch_size = local_batch_size
 
-        batch_inputs = torch.empty((local_batch_size, self.context_length), device=self.device, dtype=torch.int32)
-        batch_targets = torch.empty((local_batch_size, self.context_length), device=self.device, dtype=torch.int32)
-
         # sampler (will be sampled deterministically at all devices)
         sampled_indices = torch.randint(low=0, high=len(self), size=(batch_size,), generator=self.g)
 
         if self.is_distributed:
             # we split the work unevenly
-            if self.rank == target_log_rank:
+            if self.rank in target_log_ranks:
                 offset = self.rank * small_batch_size
             else:
                 offset = self.rank * local_batch_size
@@ -157,10 +191,10 @@ class MemoryMappedDataset:
         else:
             local_sampled_indices = sampled_indices
 
-        for sample_idx in range(local_batch_size):
-            inputs, targets = self.__getitem__(local_sampled_indices[sample_idx].item())
-            batch_inputs[sample_idx] = inputs
-            batch_targets[sample_idx] = targets
+        batch_inputs, batch_targets = self._gather_batch_numpy(local_sampled_indices.cpu().numpy())
+        batch_inputs, batch_targets = torch.from_numpy(batch_inputs), torch.from_numpy(batch_targets)
+        batch_inputs = batch_inputs.pin_memory().to(self.device, non_blocking=True)
+        batch_targets = batch_targets.pin_memory().to(self.device, non_blocking=True)
         return batch_inputs, batch_targets
 
 
