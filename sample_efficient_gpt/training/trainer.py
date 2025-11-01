@@ -4,6 +4,8 @@ from pathlib import Path
 from typing import Any
 from contextlib import nullcontext
 
+import random
+import numpy as np
 import torch
 import torch.distributed as dist
 from torch import Tensor
@@ -34,6 +36,8 @@ from sample_efficient_gpt.evals.mbpp_eval import SimpleMBPPEvaluator
 
 
 torch.set_float32_matmul_precision("high")
+# torch.backends.cuda.matmul.fp32_precision = 'ieee'
+torch._dynamo.config.allow_unspec_int_on_nn_module = True
 
 
 def mem(tag):
@@ -52,17 +56,39 @@ class Trainer:
         cfg: Config | None = None,
         load_from: str | None = None,
         load_components: str = "all",
+        compile: bool = True,
         wandb: Any | None = None,
         **cfg_overrides: dict,
     ):
+        seed = 42
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        # torch.backends.cudnn.deterministic = True
+        # torch.backends.cudnn.benchmark = False
         if cfg is None:
             assert load_from is not None, "you must load from checkpoint if cfg is None"
-            self.cfg = load_config(torch.load(load_from, map_location="cpu")["config"])
+            self.cfg = load_config(torch.load(load_from, map_location="cpu", weights_only=False)["config"])
             self.cfg = apply_overrides(self.cfg, cfg_overrides)
             logger.info(f"Loading from the checkpoint, device={self.cfg.trainer.device}")
         else:
             logger.info("Loading from config")
             self.cfg = cfg
+        self.iteration = 0           
+        self.wandb = wandb
+        self.is_distributed = dist.is_initialized()
+        if self.is_distributed:
+            self.world_size = dist.get_world_size()
+            self.rank = dist.get_rank()
+        else:
+            self.world_size, self.rank = 1, 0
+        self.target_log_rank = 0
+        for i in range(self.world_size):
+            if "RTX 5090" in torch.cuda.get_device_name(i):
+                self.target_log_rank = i
+                break
+
         self.model = Transformer(
             self.cfg.model.n_layers,
             self.cfg.model.vocab_size,
@@ -84,20 +110,21 @@ class Trainer:
             + 2 * self.cfg.model.d_model
             + 2 * self.cfg.model.d_model * self.cfg.model.d_ff
         )
-        total_params = self.cfg.model.n_layers * layer_params + self.cfg.model.d_model * self.cfg.model.vocab_size
+        self.total_params = self.cfg.model.n_layers * layer_params + self.cfg.model.d_model * self.cfg.model.vocab_size
         logger.info(
-            f"Created a model with {layer_params / 1e6:.2f}M layer and {total_params / 1e6:.1f}M total non-emb params"
+            f"Created a model with {layer_params / 1e6:.2f}M layer and "
+            f"{self.total_params / 1e6:.1f}M total non-emb params"
         )
-        self.model.to(self.cfg.trainer.device)
-        self.model.compile()
-
-        self.is_distributed = dist.is_initialized()
-        if self.is_distributed:
-            self.world_size = dist.get_world_size()
-            self.rank = dist.get_rank()
-        else:
-            self.world_size = 1
-            self.rank = 0
+        if self.wandb is not None and self.rank_zero_only:
+            self.wandb.log(
+                {
+                    "total/params": self.total_params,
+                    "total/tokens": self.cfg.trainer.max_steps
+                    * self.cfg.data.batch_size
+                    * self.cfg.data.context_length,
+                },
+                step=self.iteration,
+            )
 
         if load_components == "all":
             self._init_optimizers()
@@ -122,12 +149,6 @@ class Trainer:
         else:
             self.model.eval()
             self.optimizers = None
-
-        if self.is_distributed:
-            self.model = DDP(self.model)
-
-        self.iteration = 0
-        self.wandb = wandb
         load_from = load_from or self.cfg.trainer.load_from
         if load_from is not None:
             self.load_state(load_from)
@@ -138,18 +159,19 @@ class Trainer:
 
         tokenizer_path = self.cfg.data.tokenizer_path
         self.tokenizer = PreTrainedTokenizerFast.from_pretrained(tokenizer_path)
-        self.eos_token_id = list(self.tokenizer.added_tokens_decoder)[0]
+        self.special_tokens_ids = torch.tensor(list(self.tokenizer.added_tokens_decoder))
         self.mbbp_evaluator = SimpleMBPPEvaluator(dataset="lite", timeout=8.0)
 
         # Use per token bytes length for normalization in loss
-        # self.id2byte_len = torch.tensor(
-        #     [
-        #         len(self.tokenizer.decode([i], clean_up_tokenization_spaces=False).encode("utf-8"))
-        #         for i in range(self.tokenizer.vocab_size)
-        #     ],
-        #     device=self.cfg.trainer.device,
-        # )
-        self.id2byte_len = None
+        self.id2byte_len = torch.tensor(
+            [
+                len(self.tokenizer.decode([i], clean_up_tokenization_spaces=False).encode("utf-8"))
+                for i in range(self.tokenizer.vocab_size)
+            ],
+            device=self.cfg.trainer.device,
+        )
+        self.id2byte_len[self.special_tokens_ids] = 0
+
         # these are needed for fair comparison with non-superbpe
         if "superbpe" in self.cfg.data.tokenizer_path:
             self.train_loss_multiplier = 0.7985
@@ -162,16 +184,12 @@ class Trainer:
             f"Init [rank={self.rank}]: max_steps={self.cfg.trainer.max_steps}, start_iter={self.iteration}, "
             f"val_every={self.cfg.trainer.val_every}, save_every={self.cfg.trainer.save_every}, "
             f"world_size={self.world_size}, grad_accum={self.cfg.trainer.gradient_accumulation_steps}, "
-            f"batch_size={self.cfg.data.batch_size}",
+            f"batch_size={self.cfg.data.batch_size}, {self.target_log_rank=}",
         )
 
     @property
     def rank_zero_only(self):
-        target_log_rank = 0
-        for i in range(self.world_size):
-            if "RTX 5090" in torch.cuda.get_device_name(i):
-                target_log_rank = i
-        return not self.is_distributed or (self.is_distributed and self.rank == target_log_rank)
+        return not self.is_distributed or (self.is_distributed and self.rank == self.target_log_rank)
 
     def _init_optimizers(self):
         optimizer_kwargs = dict(
@@ -193,6 +211,8 @@ class Trainer:
                     setattr(p, "lr_mul", self.cfg.model.d_model**0.5)
                 elif "lm_head" in n:
                     setattr(p, "lr_mul", 0.5)
+                else:
+                    setattr(p, "lr_mul", 1.0)
             two_d_params = [
                 p
                 for n, p in self.model.named_parameters()
@@ -200,10 +220,7 @@ class Trainer:
             ]
 
             one_d_optimizer_kwargs = optimizer_kwargs
-            if self.is_distributed:
-                self.optimizer1 = ShardedOptimizer(one_d_params, optimizer_cls, **one_d_optimizer_kwargs)
-            else:
-                self.optimizer1 = optimizer_cls(one_d_params, **one_d_optimizer_kwargs)
+            self.optimizer1 = optimizer_cls(one_d_params, **one_d_optimizer_kwargs)
 
             if self.cfg.optim.muon_lr is None:
                 muon_lr = self.cfg.optim.lr
@@ -220,16 +237,10 @@ class Trainer:
                 weight_decay=muon_wd,
             )
 
-            if self.is_distributed:
-                self.optimizer2 = ShardedOptimizer(two_d_params, Muon, **two_d_optimizer_kwargs)
-            else:
-                self.optimizer2 = Muon(two_d_params, **two_d_optimizer_kwargs)
+            self.optimizer2 = Muon(two_d_params, **two_d_optimizer_kwargs)
             self.optimizers = [self.optimizer1, self.optimizer2]
         else:
-            if self.is_distributed:
-                self.optimizer = ShardedOptimizer(one_d_params, optimizer_cls, **optimizer_kwargs)
-            else:
-                self.optimizer = optimizer_cls(one_d_params, **one_d_optimizer_kwargs)
+            self.optimizer = optimizer_cls(one_d_params, **one_d_optimizer_kwargs)
             self.optimizers = [self.optimizer]
 
     @property
@@ -238,19 +249,18 @@ class Trainer:
 
     def load_state(self, path: Path):
         logger.info(f"Loading state from {str(path)}")
-        self.iteration = load_checkpoint(
-            path,
-            self.model.module if self.is_distributed else self.model,
-            self.optimizers,
-            device=self.cfg.trainer.device,
+        self.iteration, self.run_id = load_checkpoint(
+            path, self.cfg, getattr(self.model, "module", self.model), self.optimizers
         )
+        logger.info(f"Restored {self.iteration} iteration")
+        return self.iteration
 
     def save_state(self):
         logger.info(f"Saving training state at iter={self.iteration}")
         save_checkpoint(
             self.save_dir / f"{self.iteration}.pt",
             self.cfg,
-            self.model.module if self.is_distributed else self.model,
+            getattr(self.model, "module", self.model),
             self.optimizers,
             iteration=self.iteration,
             run_id=self.wandb.id if self.wandb is not None else None,
@@ -300,6 +310,7 @@ class Trainer:
         self.model.eval()
         val_iters = 0
         val_loss_epoch = torch.zeros((), device=self.current_device, dtype=torch.float32)
+        val_loss_bpb_epoch = torch.zeros((), device=self.current_device, dtype=torch.float32)
         for inputs, targets in tqdm(
             self.val_dataset.get_iterator(self.cfg.data.val_batch_size),
             total=len(self.val_dataset) // (self.cfg.data.val_batch_size * self.cfg.data.context_length),
@@ -369,9 +380,10 @@ class Trainer:
                 iter_wd = self.cfg.optim.muon_wd_min + ratio * (self.cfg.optim.muon_wd - self.cfg.optim.muon_wd_min)
 
             for pg in self.optimizers[1].param_groups:
-                # momentum warmup for fixed 300 steps
-                momentum = self.cfg.optim.betas[0]
-                pg["momentum"] = 0.85 + min(max(self.iteration, 1), 300) / 300 * (momentum - 0.85)
+                if self.iteration < 300:
+                    # momentum warmup for fixed 300 steps
+                    momentum = self.cfg.optim.betas[0]
+                    pg["momentum"] = 0.85 + min(max(self.iteration, 1), 300) / 300 * (momentum - 0.85)
                 pg["lr"] = iter_lr
                 if iter_wd is not None:
                     pg["wd"] = iter_wd
@@ -387,7 +399,8 @@ class Trainer:
         end = torch.cuda.Event(enable_timing=True)
         start.record()
 
-        with torch.autocast("cuda", enabled=self.cfg.trainer.dtype == "bfloat16"):
+        autocast_ctx = torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.cfg.trainer.dtype == "bfloat16")
+        with autocast_ctx:
             logits, avg_kurtosis_values = self.model(inputs)
             # using bits-per-bytes formulation of loss
             loss, z_loss = cross_entropy(logits, targets, weight=None, per_token_byte_lengths=self.id2byte_len)
@@ -414,31 +427,27 @@ class Trainer:
         end.record()
         end.synchronize()
 
-        update_ratio = 0.0
         time_comm = 0.0
         if self.iteration % self.cfg.trainer.gradient_accumulation_steps == 0:
+            update_ratios = []
             # DDP
-            if self.is_distributed:
+            if self.is_distributed and hasattr(self.model, "finish_gradient_synchronization"):
                 time_comm = self.model.finish_gradient_synchronization()
 
-            if self.cfg.trainer.dtype == "bfloat16":
-                for opt in self.optimizers:
-                    self.scaler.unscale_(opt)
-                grad_norm = clip_grad_norm_(self.model.parameters(), self.cfg.trainer.max_grad_norm)
-                for opt in self.optimizers:
-                    self.scaler.step(opt)
-                self.scaler.update()
-            else:
-                grad_norm = clip_grad_norm_(self.model.parameters(), self.cfg.trainer.max_grad_norm)
-                for opt in self.optimizers:
-                    opt.step()
+            grad_norm = clip_grad_norm_(self.model.parameters(), self.cfg.trainer.max_grad_norm)
+            for opt in self.optimizers:
+                update_ratio = opt.step()
+                update_ratios.append(update_ratio)
             for opt in self.optimizers:
                 opt.zero_grad(set_to_none=True)
         else:
             grad_norm = torch.tensor(0.0)
+            update_ratios = [torch.tensor(0.0) for _ in range(len(self.optimizers))]
 
         parameter_norms = {
-            k: p.data.detach().norm() for k, p in self.model.named_parameters() if "attn" in k or "ffn" in k
+            k: p.data.detach().norm()
+            for k, p in getattr(self.model, "module", self.model).named_parameters()
+            if "attn" in k or "ffn" in k
         }
         train_loss = loss.detach()
         z_loss = z_loss.detach()
@@ -458,15 +467,32 @@ class Trainer:
         return log
 
     def postprocess_step_stats(self, step_stats):
+        # Compute mfu here
+        step_time = step_stats["step_time"]
+        tps = self.cfg.data.batch_size * self.cfg.data.context_length / step_time
+        l, nh, hd, seq = (
+            self.cfg.model.n_layers,
+            self.cfg.model.n_heads,
+            self.cfg.model.d_model // self.cfg.model.n_heads,
+            self.cfg.data.context_length,
+        )
+        flops = (6 * self.total_params + 12 * l * nh * hd * seq) * tps
+        mfu = flops / self.available_flops
         log_processed = {
-            "train_loss": step_stats["train_loss"].item(),
-            "z_loss": step_stats["z_loss"].item(),
-            "grad_norm": step_stats["grad_norm"].item(),
             "avg_kurtosis": step_stats["avg_kurtosis"].cpu().tolist(),
             "parameter_norms": {k: v.item() for k, v in step_stats["parameter_norms"].items()},
+            "mfu": mfu,
         }
+        if self.is_distributed and self.iteration % self.cfg.trainer.gradient_accumulation_steps == 0:
+            for k in ["opt_0_update_ratio", "opt_1_update_ratio"]:
+                update_ratios = torch.zeros(self.world_size, device=step_stats[k].device, dtype=step_stats[k].dtype)
+                dist.all_gather_into_tensor(update_ratios, step_stats[k])
+                log_processed[k] = update_ratios.mean().item()
         # take any other key as it is
-        return {**log_processed, **{k: v for k, v in step_stats.items() if k not in log_processed}}
+        return {
+            **log_processed,
+            **{k: v.item() if torch.is_tensor(v) else v for k, v in step_stats.items() if k not in log_processed},
+        }
 
     def train(self):
         logger.info("Starting training loop")

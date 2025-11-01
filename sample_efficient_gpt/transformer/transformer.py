@@ -10,7 +10,7 @@ from sample_efficient_gpt.transformer.core import SwiGLU, RMSNorm, Embedding, Li
 from sample_efficient_gpt.transformer.attention import MultiHeadSelfAttention, KVCache
 from sample_efficient_gpt.utils.profiling import nvtx_range
 
-_MAX_SEQ_LEN = 4096
+_MAX_SEQ_LEN = 8192
 
 
 class Block(nn.Module):

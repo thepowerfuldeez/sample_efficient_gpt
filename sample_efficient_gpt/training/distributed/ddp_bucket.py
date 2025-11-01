@@ -8,7 +8,7 @@ from torch import Tensor
 
 
 class DDP(nn.Module):
-    def __init__(self, module, bucket_size_mb: float = 9.7):
+    def __init__(self, module, bucket_size_mb: float = 15.2):
         super().__init__()
         self.module = module
         self.bucket_size = int(bucket_size_mb * 1024 * 1024)
