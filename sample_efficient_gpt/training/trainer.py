@@ -15,7 +15,8 @@ from transformers import PreTrainedTokenizerFast
 
 from sample_efficient_gpt.transformer import Transformer
 from sample_efficient_gpt.training import (
-    load_checkpoint,
+    load_model,
+    load_optimizer,
     save_checkpoint,
     MemoryMappedDataset,
     AdamW,
@@ -75,7 +76,7 @@ class Trainer:
         else:
             logger.info("Loading from config")
             self.cfg = cfg
-        self.iteration = 0           
+        self.iteration = 0
         self.wandb = wandb
         self.is_distributed = dist.is_initialized()
         if self.is_distributed:
@@ -100,11 +101,42 @@ class Trainer:
             attn_gating=self.cfg.model.attn_gating,
             layernorm_scaling=self.cfg.model.layernorm_scaling,
             theta=self.cfg.model.theta,
-            device=self.cfg.trainer.device,
+            device="cpu",
             # always keep master weights in fp32
             dtype=torch.float32,
             weight_tying=self.cfg.model.weight_tying,
         )
+        self.model.to(self.cfg.trainer.device)
+        load_from = load_from or self.cfg.trainer.load_from
+        if load_from is not None:
+            self.load_state(load_from, model_only=True)
+
+        # maximum achievable is 90% for bf16; 80% for fp8
+        flops_multiplier = 0.9 if not self.cfg.trainer.use_fp8 else 1.6
+        if self.is_distributed:
+            if self.cfg.trainer.dist_mode == "ddp":
+                self.model = DDP(self.model)
+            elif self.cfg.trainer.dist_mode == "fsdp":
+                # FSDP setup - modern approach with mixed precision
+                from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy, FSDPModule
+
+                fsdp_kwargs = {
+                    "mp_policy": MixedPrecisionPolicy(
+                        param_dtype=torch.bfloat16,
+                        reduce_dtype=torch.float32,
+                    )
+                }
+                for layer in self.model.blocks:
+                    fully_shard(layer, **fsdp_kwargs)
+                fully_shard(self.model, **fsdp_kwargs)
+
+                assert isinstance(self.model, FSDPModule)
+            # 749.5TFLOPS of compute in bf16 when using 4 gpus
+            self.available_flops = 749.5e12 * flops_multiplier
+        else:
+            # 209.5TFLOPS of compute in bf16 when using 1 gpu
+            self.available_flops = 209.5e12 * flops_multiplier
+
         layer_params = (
             4 * self.cfg.model.d_model**2
             + 2 * self.cfg.model.d_model
@@ -128,6 +160,8 @@ class Trainer:
 
         if load_components == "all":
             self._init_optimizers()
+            if load_from is not None:
+                self.load_state(load_from, model_only=False, optimizers_only=True)
 
             logger.info(f"Model is created with hparams {self.cfg.model}")
             self.train_dataset = MemoryMappedDataset(
@@ -149,13 +183,18 @@ class Trainer:
         else:
             self.model.eval()
             self.optimizers = None
-        load_from = load_from or self.cfg.trainer.load_from
-        if load_from is not None:
-            self.load_state(load_from)
 
-        # aux scaler for bf16 if used
-        if self.cfg.trainer.dtype == "bfloat16":
-            self.scaler = torch.amp.grad_scaler.GradScaler()
+        if self.cfg.optim.scheduler == "wsd" and self.cfg.optim.wsd_phase == "decay":
+            self.decay_steps = self.cfg.trainer.max_steps - self.iteration
+            self.start_decay_step = self.iteration
+        else:
+            self.decay_steps, self.start_decay_step = 0, 0
+        if self.cfg.trainer.use_fp8:
+            convert_to_float8_training(self.model, config=config, module_filter_fn=module_filter_fn)
+            print("converted model to fp8:", self.model)
+
+        if compile:
+            self.model.compile()
 
         tokenizer_path = self.cfg.data.tokenizer_path
         self.tokenizer = PreTrainedTokenizerFast.from_pretrained(tokenizer_path)
@@ -247,11 +286,11 @@ class Trainer:
     def tokens_processed(self):
         return self.iteration * self.cfg.data.batch_size * self.cfg.data.context_length
 
-    def load_state(self, path: Path):
-        logger.info(f"Loading state from {str(path)}")
-        self.iteration, self.run_id = load_checkpoint(
-            path, self.cfg, getattr(self.model, "module", self.model), self.optimizers
-        )
+    def load_state(self, path: Path, model_only=True, optimizers_only=False):
+        logger.info(f"Loading {model_only=} state from {str(path)}")
+        if optimizers_only:
+            return load_optimizer(path, self.cfg, getattr(self.model, "module", self.model), self.optimizers)
+        self.iteration, self.run_id = load_model(path, self.cfg, getattr(self.model, "module", self.model))
         logger.info(f"Restored {self.iteration} iteration")
         return self.iteration
 

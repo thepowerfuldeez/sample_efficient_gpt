@@ -25,6 +25,17 @@ def sharded_sd_to_full(sharded_sd):
     return cpu_state_dict
 
 
+def _to_device(x, device):
+    if torch.is_tensor(x):
+        return x.to(device, non_blocking=True)
+    if isinstance(x, (list, tuple)):
+        t = [_to_device(xx, device) for xx in x]
+        return type(x)(t)
+    if isinstance(x, dict):
+        return {k: _to_device(v, device) for k, v in x.items()}
+    return x  # ints/floats/etc.
+
+
 def save_checkpoint(
     fpath: Path,
     cfg: Config | None,
@@ -59,7 +70,13 @@ def save_checkpoint(
     )
 
 
-def load_checkpoint(fpath: Path, cfg: Config, model: nn.Module, optimizers: list[Optimizer] | None) -> int:
+def load_model(fpath: Path, cfg: Config, model: nn.Module) -> int:
+    checkpoint = torch.load(fpath, map_location="cpu", weights_only=False)
+    model.load_state_dict(checkpoint["model"])
+    return checkpoint["iteration"], checkpoint.get("run_id")
+
+
+def load_optimizer(fpath: Path, cfg: Config, model, optimizers: list[Optimizer] | None) -> None:
     checkpoint = torch.load(fpath, map_location="cpu", weights_only=False)
     if cfg.trainer.dist_mode == "fsdp" and dist.is_initialized():
         set_model_state_dict(
@@ -82,13 +99,16 @@ def load_checkpoint(fpath: Path, cfg: Config, model: nn.Module, optimizers: list
                     ),
                 )
     else:
-        model.load_state_dict(checkpoint["model"])
         if optimizers is not None:
             # for muon we load 2 optimizers
             for opt, opt_sd in zip(optimizers, checkpoint["optimizer"]):
-                for ((k1, v1), (k2, v2)) in zip(opt.state_dict()['state'], opt_sd['state']):
+                for (k1, v1), (k2, v2) in zip(opt.state_dict()["state"], opt_sd["state"]):
                     assert k1 == k2 and v1.shape == v2.shape, f"{k1} != {k2} or {v1.shape=}!={v2.shape=}"
                 opt.load_state_dict(opt_sd)
+                for p, state in opt.state.items():  # keys are parameter tensors
+                    p_dev = p.device
+                    for k, v in list(state.items()):
+                        state[k] = _to_device(v, p_dev)
 
     rng = checkpoint.get("rng_state", None)
     if rng:
@@ -96,4 +116,3 @@ def load_checkpoint(fpath: Path, cfg: Config, model: nn.Module, optimizers: list
         torch.cuda.set_rng_state_all(rng["cuda"])
         np.random.set_state(rng["numpy"])
         random.setstate(rng["python"])
-    return checkpoint["iteration"], checkpoint.get("run_id")
