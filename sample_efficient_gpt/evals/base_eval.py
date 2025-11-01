@@ -21,6 +21,7 @@ from argparse import ArgumentParser
 
 import pandas as pd
 import torch
+import wandb
 
 import torch.distributed as dist
 from sample_efficient_gpt.evals.core_eval import evaluate_task
@@ -107,12 +108,13 @@ def main():
     # run with torchrun
     dist.init_process_group("nccl")
 
-
     rank = dist.get_rank()
     device = f"cuda:{rank}"
     args = parse_args()
-    
+
     trainer = Trainer(load_from=args.checkpoint, load_components="infer", **{"trainer.device": device})
+    run_id = trainer.run_id
+    project = trainer.cfg.project
     model = trainer.model
     tokenizer = trainer.tokenizer
     autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
@@ -143,8 +145,11 @@ def main():
         print0("=" * 80)
         print0(f"Model: {model_name}")
         print0("=" * 80)
-        with open(output_csv_path, "r") as f:
+        with open(output_csv_path) as f:
             print0(f.read())
+
+        with wandb.init(project=project, resume="must", id=run_id) as run:
+            run.log({"eval/core_metric": core_metric})
 
     # Log to report
     # from nanochat.report import get_report

@@ -29,16 +29,30 @@ class TokenizerProcessor:
         base_tok = "<|endoftext|>"
         self.split_re = f"({'|'.join(escaped)})" if escaped else f"({re.escape(base_tok)})"
 
-    def encode_hf(self, filepath: str, tokenized_path):
+    def encode_hf(self, filepath: str, tokenized_path, limit: int = -1):
         """
         Method to tokenize saved HF dataset directly as a form of parquet or jsonl files
         """
         path = Path(filepath)
+        if limit > 0:
+            token_count = limit
+        else:
+            token_count = None
+        current_count = 0
         # assert path.suffix == ".parquet", "Only parquet files are supported"
         parquet_files = list(path.glob("**/*.parquet"))
         jsonl_files = list(path.glob("*.jsonl.gz"))
         if parquet_files:
             for chunk_path in tqdm(parquet_files):
+                out_path = (tokenized_path / chunk_path.stem).with_suffix(".npy")
+                if out_path.exists():
+                    if limit > 0:
+                        current_count += np.load(str(out_path), mmap_mode="r").shape[0]
+                    logger.info(f"{str(out_path)} exists, skipping")
+                    continue
+                if token_count is not None and current_count > token_count:
+                    logger.info("reached limit")
+                    return
                 # df = pd.read_parquet(str(chunk_path))
                 # df = df[df["metadata"].apply(lambda x: x["edu_score"]) > 2.75]
                 # df["text"] = df["text"].apply(lambda s: s + "<|endoftext|>")
@@ -48,16 +62,22 @@ class TokenizerProcessor:
                 ds = load_dataset("parquet", data_files=str(chunk_path), split="train")  # Arrow-backed, zero-copy-ish
                 # for dclm-edu
                 if "dclm-edu" in str(chunk_path):
-                    ds = ds.filter(lambda ex: ex["metadata"]["edu_score"] > 2.75, num_proc=4, load_from_cache_file=False)
+                    ds = ds.filter(
+                        lambda ex: ex["metadata"]["edu_score"] > 2.75, num_proc=4, load_from_cache_file=False
+                    )
                 # for finemath
                 if "finemath" in str(chunk_path):
                     ds = ds.filter(lambda ex: ex["score"] > 3.7, num_proc=4, load_from_cache_file=False)
 
-                if not "stack" in str(chunk_path):
-                    ds = ds.map(lambda ex: {"text": ex["text"] + "<|endoftext|>"}, num_proc=4, load_from_cache_file=False)
+                if not "the_stack_v2_" in str(chunk_path):
+                    ds = ds.map(
+                        lambda ex: {"text": ex["text"] + "<|endoftext|>"}, num_proc=4, load_from_cache_file=False
+                    )
                 tokens, offsets = self._process_ds(ds)
-                np.save(str((tokenized_path / chunk_path.stem).with_suffix(".npy")), tokens)
+                np.save(str(out_path), tokens)
                 np.save(str((tokenized_path / f"offsets_{chunk_path.stem}").with_suffix(".npy")), offsets)
+                current_count += tokens.shape[0]
+                logger.info(f"current count: {current_count}")
         elif jsonl_files:
             # for marin-arxiv
             # chunk_size = 50
@@ -65,19 +85,28 @@ class TokenizerProcessor:
             chunk_size = 100
             chunks = [jsonl_files[i : i + 50] for i in range(0, len(jsonl_files), chunk_size)]
             for i, chunk in tqdm(list(enumerate(chunks))):
+                if token_count is not None and current_count > token_count:
+                    logger.info("reached limit")
+                    break
                 logger.info("read jsonl")
-                ds = load_dataset("json", data_files=[str(x) for x in chunk], split="train")
+                try:
+                    ds = load_dataset("json", data_files=[str(x) for x in chunk], split="train")
+                except:
+                    logger.info("error occured while reading the dataset, skipping")
+                    continue
                 ds = ds.map(lambda ex: {"text": ex["text"] + "<|endoftext|>"}, num_proc=4)
                 tokens, offsets = self._process_ds(ds)
-                np.savez(str(tokenized_path / f"{i}.npz"), values=tokens, offsets=offsets)
-        return tokens
+                np.save(str(tokenized_path / f"{i}.npy"), tokens)
+                np.save(str(tokenized_path / f"offsets_{i}.npy"), offsets)
+                current_count += tokens.shape[0]
+                logger.info(f"current count: {current_count}")
 
     def encode_hf_txt(self, filepath: Path, tokenized_path, chunk_size):
         """Method to encode folder with txt files with HF tokenizer directly"""
         txt_files = list(filepath.glob("*val*.txt")) + list(filepath.glob("*train*.txt"))
         for txt_path in txt_files:
             all_tokens = None
-            for chunk in self._split_text_file(txt_path, chunk_size):
+            for i, chunk in enumerate(self._split_text_file(txt_path, chunk_size)):
                 docs = self._process_text_chunk(chunk)
                 ds = Dataset.from_dict({"text": docs})
                 tokens, offsets = self._process_ds(ds)
@@ -85,6 +114,8 @@ class TokenizerProcessor:
                     all_tokens = tokens
                 else:
                     all_tokens = np.concat((all_tokens, tokens))
+                if (i + 1) % 5 == 0:
+                    np.save(str((tokenized_path / f"{txt_path.stem}").with_suffix(".npy")), all_tokens)
             np.save(str((tokenized_path / f"{txt_path.stem}").with_suffix(".npy")), all_tokens)
 
     def _process_ds(self, ds: Dataset):
@@ -194,6 +225,7 @@ def parse_args():
     p.add_argument("--stats-name", default="64446_stats.json")
     p.add_argument("--include-val-data", default=0, type=int)
     p.add_argument("--is-hf", default=1, type=int)
+    p.add_argument("--limit", default=-1, type=int)
     return p.parse_args()
 
 
@@ -201,6 +233,7 @@ if __name__ == "__main__":
     args = parse_args()
     tok = TokenizerProcessor(args.tokenizer_name, special_tokens=["<|endoftext|>"])
     input_dir = Path(args.data_path)
+    limit = args.limit
 
     logger.info("start")
     tokenized_path = Path(args.tokenized_data_path)
@@ -209,10 +242,10 @@ if __name__ == "__main__":
     t0 = time.monotonic()
     if args.is_hf and not list(input_dir.glob("*train*.txt")):
         print("tokenizing jsonl / parquet files by chunks with hf")
-        tok.encode_hf(input_dir, tokenized_path)
+        tok.encode_hf(input_dir, tokenized_path, limit=limit)
     elif args.is_hf and list(input_dir.glob("*train*.txt")):
         print("tokenizing txt files with hf")
-        tok.encode_hf_txt(input_dir, tokenized_path, chunk_size=512 * 1024 * 1024)
+        tok.encode_hf_txt(input_dir, tokenized_path, chunk_size=128 * 1024 * 1024)
     else:
         compression_ratios = {}
         for f in input_dir.glob("*val*.txt"):

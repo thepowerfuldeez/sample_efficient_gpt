@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from collections.abc import Iterator
 from bisect import bisect
@@ -30,27 +31,33 @@ class MemoryMappedDataset:
 
         Can also take only `rank` part of the batch for DDP training
         """
-        path_or_ds = Path(path_or_ds)
         total_length = 0
         ds = []
         lengths = [0]
-        if path_or_ds.is_dir():
-            # dataset folder contains npy files
-            for fp in sorted(path_or_ds.glob("*.npy")):
-                if "offsets_" in fp.name:
-                    continue
-                arr = self._read_file(fp)
+        path_or_ds = Path(path_or_ds)
+        # JSON provided with exact amount of data to take
+        if path_or_ds.suffix == ".json":
+            path_mapping = json.loads(path_or_ds.read_text())
+            logger.info(path_mapping)
+            for path, token_count in path_mapping.items():
+                arrays, read_lengths = self._read_folder(Path(path), lengths[-1], token_count)
+                ds.extend(arrays)
+                lengths.extend(read_lengths)
+            total_length = lengths[-1]
+        else:
+            if path_or_ds.is_dir():
+                arrays, read_lengths = self._read_folder(path_or_ds, lengths[-1])
+                ds.extend(arrays)
+                lengths.extend(read_lengths)
+                total_length = lengths[-1]
+            else:
+                arr = self._read_file(path_or_ds)
                 l = arr.shape[0]
-                total_length += l
                 lengths.append(total_length)
                 ds.append(arr)
-        else:
-            arr = self._read_file(path_or_ds)
-            l = arr.shape[0]
-            lengths.append(total_length)
-            ds.append(arr)
-            total_length += l
+                total_length += l
         self.total_length = total_length
+        assert self.total_length > 0
         self.ds = ds
         self.lengths = lengths
 
@@ -74,6 +81,23 @@ class MemoryMappedDataset:
     def _read_file(self, path):
         ds = np.load(path, mmap_mode="r")
         return ds
+    
+    def _read_folder(self, path: Path, offset_len: int, token_count: int | None = None):
+        # dataset folder contains npy files
+        arrays = []
+        lengths = []
+        current_length = 0
+        for fp in sorted(path.glob("*.npy")):
+            if token_count is not None and current_length > token_count:
+                break
+            if "offsets_" in fp.name:
+                continue
+            arr = self._read_file(fp)
+            l = arr.shape[0]
+            current_length += l
+            lengths.append(offset_len + current_length)
+            arrays.append(arr)
+        return arrays, lengths
 
     def _split_indices(self, starts: np.ndarray):
         # find ds chunks
@@ -162,15 +186,15 @@ class MemoryMappedDataset:
             # Hack for GPUS which are uneven in their power
             gpu_names = [torch.cuda.get_device_name(i) for i in range(self.world_size)]
             if (
-                self.world_size == 3
+                self.world_size == 4
                 and any(["RTX 5090" in s for s in gpu_names])
                 and any(["RTX 4090" in s for s in gpu_names])
             ):
                 target_log_ranks = [i for i in range(self.world_size) if "RTX 5090" in gpu_names[i]]
-                adj_n_chunks = 8
+                adj_n_chunks = 10
                 small_batch_size = (batch_size // adj_n_chunks) * 2
                 large_batch_size = (batch_size // adj_n_chunks) * 3
-                assert small_batch_size + 2 * large_batch_size == batch_size, "batch sizes don't match"
+                assert small_batch_size * 2 + large_batch_size * 2 == batch_size, "batch sizes don't match"
                 local_batch_size = large_batch_size if self.rank in target_log_ranks else small_batch_size
             else:
                 local_batch_size = small_batch_size
