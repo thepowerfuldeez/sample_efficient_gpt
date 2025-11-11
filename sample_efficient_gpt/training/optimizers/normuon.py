@@ -10,7 +10,6 @@ from sample_efficient_gpt.utils.profiling import nvtx_range
 # Muon optimizer
 
 
-@torch.compile(dynamic=True)
 def normuon_update(p, v, second_momentum_buffer, eff_lr, eff_weight_decay, beta2):
     ###################################
     v_norm = v.norm(dim=(-2, -1), keepdim=True)

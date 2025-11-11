@@ -81,7 +81,7 @@ class MemoryMappedDataset:
     def _read_file(self, path):
         ds = np.load(path, mmap_mode="r")
         return ds
-    
+
     def _read_folder(self, path: Path, offset_len: int, token_count: int | None = None):
         # dataset folder contains npy files
         arrays = []
@@ -217,8 +217,6 @@ class MemoryMappedDataset:
 
         batch_inputs, batch_targets = self._gather_batch_numpy(local_sampled_indices.cpu().numpy())
         batch_inputs, batch_targets = torch.from_numpy(batch_inputs), torch.from_numpy(batch_targets)
-        batch_inputs = batch_inputs.pin_memory().to(self.device, non_blocking=True)
-        batch_targets = batch_targets.pin_memory().to(self.device, non_blocking=True)
         return batch_inputs, batch_targets
 
 

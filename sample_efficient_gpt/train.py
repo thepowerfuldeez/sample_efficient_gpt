@@ -62,6 +62,7 @@ def train(rank, cfg: Config, args):
     cfg = apply_overrides(cfg, override)
     overrides = {"optim.cosine_steps": cfg.trainer.max_steps}
     cfg = apply_overrides(cfg, overrides)
+    cfg.trainer.save_dir = Path(cfg.trainer.save_dir)
     cfg.trainer.save_dir = cfg.trainer.save_dir / run_name
 
     if (args.world_size > 1 and rank == 2) or (args.world_size == 1 and rank == 0):

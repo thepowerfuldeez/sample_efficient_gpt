@@ -57,7 +57,7 @@ def calculate_settings(n):
 
 
 def get_amp_custom_fwd_bwd() -> Callable:
-    device = infer_device()
+    device = "cuda"
     return (
         functools.partial(torch.amp.custom_fwd, device_type=device),
         functools.partial(torch.amp.custom_bwd, device_type=device),

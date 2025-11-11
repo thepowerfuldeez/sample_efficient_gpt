@@ -8,7 +8,7 @@ import triton.language as tl
 from triton.language.extra.libdevice import tanh
 
 
-from sample_efficient_gpt.transformer.ops.utils import element_mul_kernel, is_hip, infer_device
+from sample_efficient_gpt.transformer.ops.utils import element_mul_kernel, is_hip
 
 
 @triton.jit
@@ -250,7 +250,7 @@ def liger_cross_entropy_kernel(
 # The hard limit of TRITON_MAX_TENSOR_NUMEL is 1048576 https://github.com/triton-lang/triton/blob/ba42a5c68fd0505f8c42f4202d53be0f8d9a5fe0/python/triton/language/core.py#L19
 # However, setting limit as 65536 as in LayerNorm tutorial is faster because of less register spilling
 # The optimal maximum block size depends on your hardware, your kernel, and your dtype
-MAX_FUSED_SIZE = 4096 if infer_device() == "xpu" else 65536 // 2  # the best size we found by manually tuning
+MAX_FUSED_SIZE = 65536 // 2  # the best size we found by manually tuning
 
 
 def cross_entropy_forward(
