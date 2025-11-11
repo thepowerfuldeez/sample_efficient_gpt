@@ -26,13 +26,19 @@ from sample_efficient_gpt.training import (
     get_wsd_lr,
     clip_grad_norm_,
     cross_entropy,
+    efficient_cross_entropy,
 )
 from sample_efficient_gpt.config_schema import Config
 from sample_efficient_gpt.utils.logger import logger
 from sample_efficient_gpt.utils.config_tools import load_config, apply_overrides
 
 from sample_efficient_gpt.training.distributed import DDP, ShardedOptimizer
-from sample_efficient_gpt.tokenizer import Tokenizer
+
+# from sample_efficient_gpt.training.fp8_utils import convert_to_float8_training
+
+from sample_efficient_gpt.training.fp8_utils import module_filter_fn, config
+from torchao.float8.float8_linear_utils import convert_to_float8_training
+
 from sample_efficient_gpt.evals.mbpp_eval import SimpleMBPPEvaluator
 
 
@@ -61,23 +67,6 @@ class Trainer:
         wandb: Any | None = None,
         **cfg_overrides: dict,
     ):
-        seed = 42
-        random.seed(seed)
-        np.random.seed(seed)
-        torch.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-        # torch.backends.cudnn.deterministic = True
-        # torch.backends.cudnn.benchmark = False
-        if cfg is None:
-            assert load_from is not None, "you must load from checkpoint if cfg is None"
-            self.cfg = load_config(torch.load(load_from, map_location="cpu", weights_only=False)["config"])
-            self.cfg = apply_overrides(self.cfg, cfg_overrides)
-            logger.info(f"Loading from the checkpoint, device={self.cfg.trainer.device}")
-        else:
-            logger.info("Loading from config")
-            self.cfg = cfg
-        self.iteration = 0
-        self.wandb = wandb
         self.is_distributed = dist.is_initialized()
         if self.is_distributed:
             self.world_size = dist.get_world_size()
@@ -90,6 +79,25 @@ class Trainer:
                 self.target_log_rank = i
                 break
 
+        seed = 42 + self.rank
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        # torch.backends.cudnn.deterministic = True
+        # torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.benchmark = True
+        if cfg is None:
+            assert load_from is not None, "you must load from checkpoint if cfg is None"
+            self.cfg = load_config(torch.load(load_from, map_location="cpu", weights_only=False)["config"])
+            self.cfg = apply_overrides(self.cfg, cfg_overrides)
+            logger.info(f"Loading from the checkpoint, device={self.cfg.trainer.device}")
+        else:
+            logger.info("Loading from config")
+            self.cfg = cfg
+        self.iteration = 0
+        self.wandb = wandb
+        
         self.model = Transformer(
             self.cfg.model.n_layers,
             self.cfg.model.vocab_size,
@@ -168,7 +176,7 @@ class Trainer:
                 self.cfg.data.train_path,
                 self.cfg.data.context_length,
                 torch.device(self.cfg.trainer.device),
-                self.cfg.data.seed,
+                self.cfg.data.seed + self.rank,
                 world_size=self.world_size,
                 rank=self.rank,
             )
@@ -176,7 +184,7 @@ class Trainer:
                 self.cfg.data.validation_path,
                 self.cfg.data.context_length,
                 torch.device(self.cfg.trainer.device),
-                self.cfg.data.seed,
+                self.cfg.data.seed + self.rank,
             )
             self.save_dir = Path(self.cfg.trainer.save_dir)
             self.save_dir.mkdir(exist_ok=True, parents=True)
@@ -352,26 +360,35 @@ class Trainer:
         val_loss_bpb_epoch = torch.zeros((), device=self.current_device, dtype=torch.float32)
         for inputs, targets in tqdm(
             self.val_dataset.get_iterator(self.cfg.data.val_batch_size),
-            total=len(self.val_dataset) // (self.cfg.data.val_batch_size * self.cfg.data.context_length),
+            total=len(self.val_dataset) // (self.cfg.data.val_batch_size * (self.cfg.data.context_length + 1)),
             desc="Running validation",
         ):
             with (
                 torch.inference_mode(),
-                torch.autocast("cuda", enabled=self.cfg.trainer.dtype == "bfloat16"),
+                torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.cfg.trainer.dtype == "bfloat16"),
             ):
                 logits, _ = self.model(inputs)
-                val_loss, _ = cross_entropy(logits, targets, weight=None, per_token_byte_lengths=self.id2byte_len)
+                val_loss, _, val_loss_bpb = efficient_cross_entropy(
+                    logits,
+                    targets,
+                    weight=None,
+                    per_token_byte_lengths=self.id2byte_len,
+                )
+                # multiply for reporting
                 val_loss *= self.val_loss_multiplier
                 val_loss_epoch += val_loss.to(torch.float32)
+                val_loss_bpb_epoch += val_loss_bpb.to(torch.float32)
                 val_iters += 1
         mem("after validation")
         val_loss_epoch = (val_loss_epoch / val_iters).item()
+        val_loss_bpb_epoch = (val_loss_bpb_epoch / val_iters).item()
 
         # metrics = self.mbbp_evaluator.evaluate_with_generate(self.generate, num_samples=1, mode="full")
         # logger.info(metrics)
 
         return {
             "val_loss": val_loss_epoch,
+            "val_loss_bpb": val_loss_bpb_epoch,
             "val_perplexity": 2.71828**val_loss_epoch,
             # "mbpp_lite_pass_1": metrics["pass_at_k"]["base"]["pass@1"]
         }
@@ -391,9 +408,12 @@ class Trainer:
                 lr,
                 lr_min,
                 self.cfg.optim.warmup_steps,
-                self.cfg.optim.stable_steps,
-                self.cfg.optim.decay_steps,
+                self.decay_steps,
+                self.start_decay_step,
+                self.cfg.optim.wsd_need_warmup,
+                self.cfg.optim.wsd_phase,
             )
+        
         else:
             raise ValueError("unrecognized optim scheduler")
         return iter_lr
@@ -413,11 +433,7 @@ class Trainer:
         if self.cfg.optim.use_muon:
             # second optimizer is muon
             iter_lr = self._get_lr(self.cfg.optim.muon_lr, self.cfg.optim.muon_lr * self.cfg.optim.lr_min_coeff)
-            if self.cfg.optim.muon_wd_min is not None:
-                # just a linear warmup
-                ratio = 1 - (self.cfg.trainer.max_steps - self.iteration) / self.cfg.trainer.max_steps
-                iter_wd = self.cfg.optim.muon_wd_min + ratio * (self.cfg.optim.muon_wd - self.cfg.optim.muon_wd_min)
-
+            
             for pg in self.optimizers[1].param_groups:
                 if self.iteration < 300:
                     # momentum warmup for fixed 300 steps
@@ -442,25 +458,34 @@ class Trainer:
         with autocast_ctx:
             logits, avg_kurtosis_values = self.model(inputs)
             # using bits-per-bytes formulation of loss
-            loss, z_loss = cross_entropy(logits, targets, weight=None, per_token_byte_lengths=self.id2byte_len)
-            loss *= self.train_loss_multiplier
-            z_loss *= self.train_loss_multiplier
-        if self.cfg.trainer.gradient_accumulation_steps > 1:
-            loss /= self.cfg.trainer.gradient_accumulation_steps
-            z_loss /= self.cfg.trainer.gradient_accumulation_steps
+            loss, z_loss, loss_bpb = efficient_cross_entropy(
+                logits,
+                targets,
+                weight=None,
+                per_token_byte_lengths=self.id2byte_len,
+            )
 
-        loss_for_backward = loss + z_loss_weight * z_loss
+        coef = 1.0
+        # we would divide loss for backward so that at all-reduce we get scaled grads
+        if self.cfg.trainer.gradient_accumulation_steps > 1:
+            coef /= self.cfg.trainer.gradient_accumulation_steps
+
+        # Compute proper coefficient based on grad accum / DDP
+        if self.is_distributed:
+            coef *= self.train_dataset.local_batch_size / self.cfg.data.batch_size
+
+        # fused loss implementation already includes z_loss with coef
+        loss_for_backward = loss * coef
 
         if self.is_distributed:
-            coef = self.train_dataset.local_batch_size / self.cfg.data.batch_size
-            loss_for_backward *= coef
+            if hasattr(self.model, "no_sync"):
+                context = self.model.no_sync()
+        else:
+            context = nullcontext()
 
-        context = self.model.no_sync() if self.is_distributed else nullcontext()
+        
         with context:
-            if self.cfg.trainer.dtype == "bfloat16":
-                self.scaler.scale(loss_for_backward).backward()
-            else:
-                loss_for_backward.backward()
+            loss_for_backward.backward()
 
         # TODO: this will block execution of cuda stream so remove when not needed
         end.record()
@@ -488,14 +513,15 @@ class Trainer:
             for k, p in getattr(self.model, "module", self.model).named_parameters()
             if "attn" in k or "ffn" in k
         }
-        train_loss = loss.detach()
-        z_loss = z_loss.detach()
+        # scale reported loss if it's superbpe
+        train_loss = loss.detach() * self.train_loss_multiplier
+        z_loss = z_loss.detach() * self.train_loss_multiplier
         log = {
-            "train_loss": train_loss * self.cfg.trainer.gradient_accumulation_steps,
-            "z_loss": z_loss * self.cfg.trainer.gradient_accumulation_steps,
+            "train_loss": train_loss,
+            "train_loss_bpb": loss_bpb,
+            "z_loss": z_loss,
             "grad_norm": grad_norm,
             "learning_rate": iter_lr,
-            "update_ratio": update_ratio,
             "avg_kurtosis": avg_kurtosis_values,
             "parameter_norms": parameter_norms,
             "time_comm": time_comm,
@@ -503,6 +529,8 @@ class Trainer:
         }
         if iter_wd is not None:
             log["wd"] = iter_wd
+        for i, update_ratio in enumerate(update_ratios):
+            log[f"opt_{i}_update_ratio"] = update_ratio
         return log
 
     def postprocess_step_stats(self, step_stats):
@@ -543,35 +571,45 @@ class Trainer:
                     val_metrics = self.validate()
                     self.log(val_metrics)
 
+            start = time.monotonic()
             inputs, targets = self.train_dataset.get_batch(self.cfg.data.batch_size)
-            t0 = time.monotonic()
+            device = self.cfg.trainer.device
+            inputs, targets = inputs.to(device, non_blocking=True), targets.to(device, non_blocking=True)
             raw_step_stats = self.train_step(inputs, targets)
-            t1 = time.monotonic()
+            end = time.monotonic()
+
+            raw_step_stats["step_time"] = end - start
+            step_stats = self.postprocess_step_stats(raw_step_stats)
+
             if self.iteration % self.cfg.trainer.log_every == 0 and self.rank_zero_only:
                 logger.info(f"Train iteration {self.iteration}")
                 # call item and introduce sync
-                step_stats = self.postprocess_step_stats(raw_step_stats)
                 kurtosis_log = {f"log/block{i}_kurtosis": v for i, v in enumerate(step_stats["avg_kurtosis"])}
                 pnorm_log = {f"log/{k}_norm": v for k, v in step_stats["parameter_norms"].items()}
                 self.log(
                     {
                         "train/loss": step_stats["train_loss"],
+                        "train/loss_bpb": step_stats["train_loss_bpb"],
                         "train/z_loss": step_stats["z_loss"],
                         "train/grad_norm": step_stats["grad_norm"],
                         "train/learning_rate": step_stats["learning_rate"],
                         "train/wd": step_stats["wd"],
-                        "train/update_ratio": step_stats["update_ratio"],
+                        "train/opt_0_update_ratio": step_stats["opt_0_update_ratio"],
+                        "train/opt_1_update_ratio": step_stats["opt_1_update_ratio"],
                         "train/step": self.iteration,
-                        "train/step_time": t1 - t0,
+                        "train/step_time": step_stats["step_time"],
                         "train/step_comm_time": step_stats["time_comm"],
                         "train/tokens_processed": self.tokens_processed,
+                        "train/mfu": step_stats["mfu"],
                         **kurtosis_log,
                         **pnorm_log,
                     }
                 )
-                # rank fwd_bwd time on each rank
+            if self.iteration % self.cfg.trainer.log_every == 0:
+                # log fwd_bwd time on each rank
                 self.log(
-                    {f"train/rank_{self.rank}_fwd_bwd_time": raw_step_stats[f"rank_{self.rank}_fwd_bwd"]}, rank_zero=False
+                    {f"train/rank_{self.rank}_fwd_bwd_time": raw_step_stats[f"rank_{self.rank}_fwd_bwd"]},
+                    rank_zero=False,
                 )
             self.iteration += 1
         if self.rank_zero_only:
