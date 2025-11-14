@@ -32,6 +32,7 @@ class OptimConfig:
     seesaw_steps: tuple[int] = tuple()
     wsd_need_warmup: bool = True
     wsd_phase: str = "stable"  # stable or decay
+    wsd_decay_step: str | None = None  # current step if None
 
 
 @dataclass(frozen=True)

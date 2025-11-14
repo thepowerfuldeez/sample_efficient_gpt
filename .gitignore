@@ -5,6 +5,9 @@ aws/
 **/*.txt
 **/*.pickle
 **/*.pt
+**/*.log
+**/*.sh
+**/*.ipynb
 data/
 data_tokenized/
 **/__pycache__

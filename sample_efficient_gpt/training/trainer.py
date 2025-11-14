@@ -193,8 +193,8 @@ class Trainer:
             self.optimizers = None
 
         if self.cfg.optim.scheduler == "wsd" and self.cfg.optim.wsd_phase == "decay":
-            self.decay_steps = self.cfg.trainer.max_steps - self.iteration
-            self.start_decay_step = self.iteration
+            self.start_decay_step = self.cfg.optim.wsd_decay_step or self.iteration
+            self.decay_steps = self.cfg.trainer.max_steps - self.start_decay_step
         else:
             self.decay_steps, self.start_decay_step = 0, 0
         if self.cfg.trainer.use_fp8:
@@ -355,6 +355,7 @@ class Trainer:
     def validate(self):
         mem("before validation")
         self.model.eval()
+        torch.cuda.empty_cache()
         val_iters = 0
         val_loss_epoch = torch.zeros((), device=self.current_device, dtype=torch.float32)
         val_loss_bpb_epoch = torch.zeros((), device=self.current_device, dtype=torch.float32)
@@ -364,7 +365,7 @@ class Trainer:
             desc="Running validation",
         ):
             with (
-                torch.inference_mode(),
+                torch.no_grad(),
                 torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.cfg.trainer.dtype == "bfloat16"),
             ):
                 logits, _ = self.model(inputs)
@@ -450,9 +451,9 @@ class Trainer:
 
         z_loss_weight = self.cfg.trainer.z_loss_weight
 
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
+        # start = torch.cuda.Event(enable_timing=True)
+        # end = torch.cuda.Event(enable_timing=True)
+        # start.record()
 
         autocast_ctx = torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.cfg.trainer.dtype == "bfloat16")
         with autocast_ctx:
@@ -488,8 +489,8 @@ class Trainer:
             loss_for_backward.backward()
 
         # TODO: this will block execution of cuda stream so remove when not needed
-        end.record()
-        end.synchronize()
+        # end.record()
+        # end.synchronize()
 
         time_comm = 0.0
         if self.iteration % self.cfg.trainer.gradient_accumulation_steps == 0:
@@ -525,7 +526,8 @@ class Trainer:
             "avg_kurtosis": avg_kurtosis_values,
             "parameter_norms": parameter_norms,
             "time_comm": time_comm,
-            f"rank_{self.rank}_fwd_bwd": start.elapsed_time(end) / 1e3,
+            # f"rank_{self.rank}_fwd_bwd": start.elapsed_time(end) / 1e3,
+            f"rank_{self.rank}_fwd_bwd": 0,
         }
         if iter_wd is not None:
             log["wd"] = iter_wd
