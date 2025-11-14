@@ -1,4 +1,5 @@
 import json
+import threading
 from pathlib import Path
 from collections.abc import Iterator
 from bisect import bisect
@@ -31,6 +32,7 @@ class MemoryMappedDataset:
 
         Can also take only `rank` part of the batch for DDP training
         """
+        self._prefetch_batch = None
         total_length = 0
         ds = []
         lengths = [0]
@@ -60,6 +62,8 @@ class MemoryMappedDataset:
         assert self.total_length > 0
         self.ds = ds
         self.lengths = lengths
+        self.lengths_np = np.array(self.lengths, dtype=np.int64)
+        self.chunk_sizes_np = np.array([arr.shape[0] for arr in self.ds], dtype=np.int64)
 
         # per-chunk window views for fast in-chunk slices
         self.chunk_windows = [sliding_window_view(arr, context_length + 1) for arr in self.ds]
@@ -77,6 +81,11 @@ class MemoryMappedDataset:
         self.is_distributed = world_size > 1
         self.local_batch_size = None
         self.N = self.total_length - self.context_length
+
+        # Hack for GPUS which are uneven in their power
+        self.gpu_names = None
+        if self.is_distributed and torch.cuda.is_available():
+            self.gpu_names = [torch.cuda.get_device_name(i) for i in range(self.world_size)]
 
     def _read_file(self, path):
         ds = np.load(path, mmap_mode="r")
@@ -100,13 +109,12 @@ class MemoryMappedDataset:
         return arrays, lengths
 
     def _split_indices(self, starts: np.ndarray):
+        ds_left_chunks = np.searchsorted(self.lengths_np, starts, side="right") - 1
         # find ds chunks
-        ds_left_chunks = np.searchsorted(self.lengths, starts, side="right") - 1
-        offs = starts - np.array(self.lengths, dtype=np.int64)[ds_left_chunks]
+        offs = starts - self.lengths_np[ds_left_chunks]
+        context_span = self.context_length + 1
         # Determine which ones stay within the same chunk
-        in_chunk = offs + (self.context_length + 1) <= np.array(
-            [self.ds[chunk_ind].shape[0] for chunk_ind in ds_left_chunks]
-        )
+        in_chunk = offs + context_span <= self.chunk_sizes_np[ds_left_chunks]
         return ds_left_chunks, offs, in_chunk
 
     def _gather_batch_numpy(self, starts: np.ndarray):
@@ -173,7 +181,7 @@ class MemoryMappedDataset:
             batch_targets = batch_targets.pin_memory().to(self.device, non_blocking=True)
             yield batch_inputs, batch_targets
 
-    def get_batch(self, batch_size: int) -> tuple[Int[Tensor, "bs context"], Int[Tensor, "bs context"]]:
+    def _get_batch_internal(self, batch_size: int) -> tuple[Int[Tensor, "bs context"], Int[Tensor, "bs context"]]:
         """
         Get a batch of data from memory mapped x: np.ndarray
 
@@ -183,14 +191,13 @@ class MemoryMappedDataset:
             # We want to split unevenly across workers
             target_log_ranks = [0]
             small_batch_size = batch_size // self.world_size
-            # Hack for GPUS which are uneven in their power
-            gpu_names = [torch.cuda.get_device_name(i) for i in range(self.world_size)]
+
             if (
                 self.world_size == 4
-                and any(["RTX 5090" in s for s in gpu_names])
-                and any(["RTX 4090" in s for s in gpu_names])
+                and any(["RTX 5090" in s for s in self.gpu_names])
+                and any(["RTX 4090" in s for s in self.gpu_names])
             ):
-                target_log_ranks = [i for i in range(self.world_size) if "RTX 5090" in gpu_names[i]]
+                target_log_ranks = [i for i in range(self.world_size) if "RTX 5090" in self.gpu_names[i]]
                 adj_n_chunks = 10
                 small_batch_size = (batch_size // adj_n_chunks) * 2
                 large_batch_size = (batch_size // adj_n_chunks) * 3
@@ -218,6 +225,29 @@ class MemoryMappedDataset:
         batch_inputs, batch_targets = self._gather_batch_numpy(local_sampled_indices.cpu().numpy())
         batch_inputs, batch_targets = torch.from_numpy(batch_inputs), torch.from_numpy(batch_targets)
         return batch_inputs, batch_targets
+
+    def _prefetch(self, batch_size):
+        # compute next batch on CPU thread
+        batch_inputs, batch_targets = self._get_batch_internal(batch_size)
+
+        if torch.cuda.is_available():
+            batch_inputs = batch_inputs.pin_memory()
+            batch_targets = batch_targets.pin_memory()
+
+        self._prefetch_batch = (batch_inputs, batch_targets)
+
+    def get_batch(self, batch_size):
+        if self._prefetch_batch is None:
+            # first call – generate immediately
+            self._prefetch(batch_size)
+
+        out = self._prefetch_batch
+
+        # generate the next batch asynchronously
+        # NOTE: this stays on CPU and overlaps with GPU compute
+        threading.Thread(target=self._prefetch, args=(batch_size,), daemon=True).start()
+
+        return out
 
 
 # ds of len 10
