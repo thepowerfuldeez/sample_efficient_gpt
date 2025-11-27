@@ -33,6 +33,8 @@ class MemoryMappedDataset:
         Can also take only `rank` part of the batch for DDP training
         """
         self._prefetch_batch = None
+        self._prefetch_event = threading.Event()
+        self._prefetch_lock = threading.Lock()
         total_length = 0
         ds = []
         lengths = [0]
@@ -177,8 +179,8 @@ class MemoryMappedDataset:
             batch_inputs = chunk[:, :-1].astype(np.int32, copy=False)
             batch_targets = chunk[:, 1:].astype(np.int32, copy=False)
             batch_inputs, batch_targets = torch.from_numpy(batch_inputs), torch.from_numpy(batch_targets)
-            batch_inputs = batch_inputs.pin_memory().to(self.device, non_blocking=True)
-            batch_targets = batch_targets.pin_memory().to(self.device, non_blocking=True)
+            batch_inputs = batch_inputs.pin_memory()
+            batch_targets = batch_targets.pin_memory()
             yield batch_inputs, batch_targets
 
     def _get_batch_internal(self, batch_size: int) -> tuple[Int[Tensor, "bs context"], Int[Tensor, "bs context"]]:
@@ -227,24 +229,31 @@ class MemoryMappedDataset:
         return batch_inputs, batch_targets
 
     def _prefetch(self, batch_size):
-        # compute next batch on CPU thread
         batch_inputs, batch_targets = self._get_batch_internal(batch_size)
 
         if torch.cuda.is_available():
             batch_inputs = batch_inputs.pin_memory()
             batch_targets = batch_targets.pin_memory()
 
-        self._prefetch_batch = (batch_inputs, batch_targets)
+        with self._prefetch_lock:
+            self._prefetch_batch = (batch_inputs, batch_targets)
+            self._prefetch_event.set()  # mark ready
 
     def get_batch(self, batch_size):
-        if self._prefetch_batch is None:
-            # first call – generate immediately
+        # First ever call: compute synchronously
+        if self._prefetch_batch is None and not self._prefetch_event.is_set():
             self._prefetch(batch_size)
 
-        out = self._prefetch_batch
+        # Wait until a prefetched batch is ready
+        self._prefetch_event.wait()
 
-        # generate the next batch asynchronously
-        # NOTE: this stays on CPU and overlaps with GPU compute
+        # Take current batch
+        with self._prefetch_lock:
+            out = self._prefetch_batch
+            # reset the flag so the next prefetch can signal again
+            self._prefetch_event.clear()
+
+        # Kick off prefetch of the *next* batch in the background
         threading.Thread(target=self._prefetch, args=(batch_size,), daemon=True).start()
 
         return out

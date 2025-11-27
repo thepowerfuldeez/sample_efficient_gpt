@@ -50,12 +50,6 @@ def save_checkpoint(
     else:
         model_state_dict = model.state_dict()
         optimizers_state_dict = [optimizer.state_dict() for optimizer in optimizers]
-    torch_state = {
-        "torch": torch.get_rng_state(),
-        "cuda": torch.cuda.get_rng_state_all(),
-        "numpy": np.random.get_state(),
-        "python": random.getstate(),
-    }
 
     torch.save(
         {
@@ -64,7 +58,6 @@ def save_checkpoint(
             "optimizer": optimizers_state_dict,
             "iteration": iteration,
             "run_id": run_id,
-            "rng_state": torch_state,
         },
         fpath,
     )
@@ -99,7 +92,10 @@ def load_optimizer(fpath: Path, cfg: Config, model, optimizers: list[Optimizer] 
                     ),
                 )
     else:
-        if optimizers is not None:
+        if optimizers is not None and optimizers[0] is not None:
+            if checkpoint["optimizer"] is None or (isinstance(checkpoint['optimizer'], list) and checkpoint["optimizer"][0] is None):
+                print("no optimizers detected in the checkpoint, skipping...")
+                return
             # for muon we load 2 optimizers
             for opt, opt_sd in zip(optimizers, checkpoint["optimizer"]):
                 for (k1, v1), (k2, v2) in zip(opt.state_dict()["state"], opt_sd["state"]):
@@ -109,10 +105,3 @@ def load_optimizer(fpath: Path, cfg: Config, model, optimizers: list[Optimizer] 
                     p_dev = p.device
                     for k, v in list(state.items()):
                         state[k] = _to_device(v, p_dev)
-
-    rng = checkpoint.get("rng_state", None)
-    if rng:
-        torch.set_rng_state(rng["torch"])
-        torch.cuda.set_rng_state_all(rng["cuda"])
-        np.random.set_state(rng["numpy"])
-        random.setstate(rng["python"])

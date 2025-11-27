@@ -1,4 +1,4 @@
-import math
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -24,6 +24,7 @@ from sample_efficient_gpt.training import (
     Lion,
     get_cosine_lr,
     get_wsd_lr,
+    get_seesaw_lr,
     clip_grad_norm_,
     cross_entropy,
     efficient_cross_entropy,
@@ -34,16 +35,10 @@ from sample_efficient_gpt.utils.config_tools import load_config, apply_overrides
 
 from sample_efficient_gpt.training.distributed import DDP, ShardedOptimizer
 
-# from sample_efficient_gpt.training.fp8_utils import convert_to_float8_training
-
-from sample_efficient_gpt.training.fp8_utils import module_filter_fn, config
-from torchao.float8.float8_linear_utils import convert_to_float8_training
-
 from sample_efficient_gpt.evals.mbpp_eval import SimpleMBPPEvaluator
 
 
 torch.set_float32_matmul_precision("high")
-# torch.backends.cuda.matmul.fp32_precision = 'ieee'
 torch._dynamo.config.allow_unspec_int_on_nn_module = True
 
 
@@ -84,8 +79,6 @@ class Trainer:
         np.random.seed(seed)
         torch.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
-        # torch.backends.cudnn.deterministic = True
-        # torch.backends.cudnn.benchmark = False
         torch.backends.cudnn.benchmark = True
         if cfg is None:
             assert load_from is not None, "you must load from checkpoint if cfg is None"
@@ -97,7 +90,7 @@ class Trainer:
             self.cfg = cfg
         self.iteration = 0
         self.wandb = wandb
-        
+
         self.model = Transformer(
             self.cfg.model.n_layers,
             self.cfg.model.vocab_size,
@@ -197,23 +190,25 @@ class Trainer:
             self.decay_steps = self.cfg.trainer.max_steps - self.start_decay_step
         else:
             self.decay_steps, self.start_decay_step = 0, 0
-        if self.cfg.trainer.use_fp8:
-            convert_to_float8_training(self.model, config=config, module_filter_fn=module_filter_fn)
-            print("converted model to fp8:", self.model)
+        # if self.cfg.trainer.use_fp8:
+        #     convert_to_float8_training(self.model, config=config, module_filter_fn=module_filter_fn)
+        #     print("converted model to fp8:", self.model)
 
         if compile:
             self.model.compile()
 
         tokenizer_path = self.cfg.data.tokenizer_path
         self.tokenizer = PreTrainedTokenizerFast.from_pretrained(tokenizer_path)
-        self.special_tokens_ids = torch.tensor(list(self.tokenizer.added_tokens_decoder))
+        self.special_tokens_ids = torch.tensor(
+            [x for x in self.tokenizer.added_tokens_decoder if x < self.cfg.model.vocab_size]
+        )
         self.mbbp_evaluator = SimpleMBPPEvaluator(dataset="lite", timeout=8.0)
 
         # Use per token bytes length for normalization in loss
         self.id2byte_len = torch.tensor(
             [
                 len(self.tokenizer.decode([i], clean_up_tokenization_spaces=False).encode("utf-8"))
-                for i in range(self.tokenizer.vocab_size)
+                for i in range(self.cfg.model.vocab_size)
             ],
             device=self.cfg.trainer.device,
         )
@@ -364,6 +359,8 @@ class Trainer:
             total=len(self.val_dataset) // (self.cfg.data.val_batch_size * (self.cfg.data.context_length + 1)),
             desc="Running validation",
         ):
+            inputs = inputs.to(self.cfg.trainer.device)
+            targets = targets.to(self.cfg.trainer.device)
             with (
                 torch.no_grad(),
                 torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.cfg.trainer.dtype == "bfloat16"),
@@ -386,6 +383,7 @@ class Trainer:
 
         # metrics = self.mbbp_evaluator.evaluate_with_generate(self.generate, num_samples=1, mode="full")
         # logger.info(metrics)
+        torch.cuda.empty_cache()
 
         return {
             "val_loss": val_loss_epoch,
@@ -414,7 +412,15 @@ class Trainer:
                 self.cfg.optim.wsd_need_warmup,
                 self.cfg.optim.wsd_phase,
             )
-        
+        elif self.cfg.optim.scheduler == "seesaw":
+            # As per https://arxiv.org/abs/2510.14717 but doubling GA instead of batch size
+            iter_lr = get_seesaw_lr(self.iteration, lr, self.cfg.optim.warmup_steps, self.cfg.optim.seesaw_steps)
+            if self.iteration in self.cfg.optim.seesaw_steps:
+                self.cfg.trainer.gradient_accumulation_steps *= 2
+                logger.info(
+                    f"Global batch size is changed to "
+                    f"{self.cfg.data.batch_size * self.cfg.trainer.gradient_accumulation_steps}"
+                )
         else:
             raise ValueError("unrecognized optim scheduler")
         return iter_lr
@@ -434,7 +440,7 @@ class Trainer:
         if self.cfg.optim.use_muon:
             # second optimizer is muon
             iter_lr = self._get_lr(self.cfg.optim.muon_lr, self.cfg.optim.muon_lr * self.cfg.optim.lr_min_coeff)
-            
+
             for pg in self.optimizers[1].param_groups:
                 if self.iteration < 300:
                     # momentum warmup for fixed 300 steps
@@ -481,10 +487,14 @@ class Trainer:
         if self.is_distributed:
             if hasattr(self.model, "no_sync"):
                 context = self.model.no_sync()
+            elif (
+                self.cfg.trainer.dist_mode == "fsdp"
+                and self.iteration % self.cfg.trainer.gradient_accumulation_steps != 0
+            ):
+                self.model.set_requires_gradient_sync(False)
         else:
             context = nullcontext()
 
-        
         with context:
             loss_for_backward.backward()
 
@@ -498,6 +508,9 @@ class Trainer:
             # DDP
             if self.is_distributed and hasattr(self.model, "finish_gradient_synchronization"):
                 time_comm = self.model.finish_gradient_synchronization()
+            # FSDP
+            if self.cfg.trainer.dist_mode == "fsdp":
+                self.model.set_requires_gradient_sync(True)
 
             grad_norm = clip_grad_norm_(self.model.parameters(), self.cfg.trainer.max_grad_norm)
             for opt in self.optimizers:
@@ -569,14 +582,15 @@ class Trainer:
             if self.rank_zero_only:
                 if self.iteration % self.cfg.trainer.save_every == 0:
                     self.save_state()
-                if self.iteration > 0 and self.iteration % self.cfg.trainer.val_every == 0:
+                run_eval = not os.getenv("NO_VAL", "0") == "1"
+                if run_eval and self.iteration > 0 and self.iteration % self.cfg.trainer.val_every == 0:
                     val_metrics = self.validate()
                     self.log(val_metrics)
 
             start = time.monotonic()
             inputs, targets = self.train_dataset.get_batch(self.cfg.data.batch_size)
             device = self.cfg.trainer.device
-            inputs, targets = inputs.to(device, non_blocking=True), targets.to(device, non_blocking=True)
+            inputs, targets = inputs.to(device), targets.to(device)
             raw_step_stats = self.train_step(inputs, targets)
             end = time.monotonic()
 
@@ -616,5 +630,6 @@ class Trainer:
             self.iteration += 1
         if self.rank_zero_only:
             self.save_state()
-            val_metrics = self.validate()
-            self.log(val_metrics)
+            if not os.getenv("NO_VAL", "0") == "1":
+                val_metrics = self.validate()
+                self.log(val_metrics)

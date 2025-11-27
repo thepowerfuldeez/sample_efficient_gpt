@@ -61,27 +61,6 @@ class Block(nn.Module):
         y = x + attn_out
         return y + self.ffn(self.ln2(y)), avg_kurtosis, v
 
-    def forward_tp(
-        self,
-        x: Float[Tensor, "b seq d_model / 2"],
-        token_positions: Int[Tensor, "b seq"] | None = None,
-        v1: Tensor | None = None,
-    ) -> Float[Tensor, "b seq d_model"]:
-        assert dist.is_initialized()
-
-        x: Float[Tensor, "b seq d_model / 2"] = self.ln1(x)
-        activations: list = [torch.empty_like(x) for _ in range(dist.get_world_size())]
-        dist.all_gather(tensor_list=activations, tensor=x)
-        x: Float[Tensor, "b seq d_model"] = torch.cat(x, dim=-1)
-
-        attn_out, v = self.attn(x, token_positions, v1=v1)
-        # attn_out: Float["bs seq d_model / 2"]
-        dist.reduce_scatter(attn_out)
-
-        # prenorm_act_norm = x.detach().pow(2).mean(dim=-1).sqrt().mean()
-        y = x + attn_out
-        return y + self.ffn(self.ln2(y)), v
-
 
 class Transformer(nn.Module):
     def __init__(
@@ -125,7 +104,9 @@ class Transformer(nn.Module):
         if weight_tying:
             self.lm_head.weight = self.embedding.weight
 
-    def forward(self, x: Int[Tensor, "bs seq"], kv_cache: list[KVCache] | None = None) -> Float[Tensor, "bs seq vocab_size"]:
+    def forward(
+        self, x: Int[Tensor, "bs seq"], kv_cache: list[KVCache] | None = None
+    ) -> Float[Tensor, "bs seq vocab_size"]:
         x: Float[Tensor, "bs seq d_model"] = self.embedding(x)
         avg_kurtosis_values: Float[Tensor, "n_layers"] = torch.zeros(
             (len(self.blocks),), dtype=x.dtype, device=x.device

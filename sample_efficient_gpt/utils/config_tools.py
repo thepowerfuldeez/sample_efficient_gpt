@@ -1,15 +1,19 @@
+import importlib
 import json
 from dataclasses import asdict, replace
-from typing import Any
 from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+import yaml
 
 from sample_efficient_gpt.config_schema import (
     Config,
-    default_cfg,
     DataConfig,
     ModelConfig,
-    TrainerConfig,
     OptimConfig,
+    TrainerConfig,
+    default_cfg,
 )
 
 
@@ -50,20 +54,67 @@ def apply_overrides(cfg, overrides: dict[str, Any]):
     return cfg
 
 
+def _merge_section(section: dict[str, Any] | None, defaults) -> dict[str, Any]:
+    merged = dataclass_to_nested_dict(defaults)
+    if section:
+        merged.update(section)
+    return merged
+
+
+def _load_base_cfg(base_name: str | None) -> Config:
+    if not base_name:
+        return default_cfg
+    module_name = base_name
+    if not module_name.startswith("sample_efficient_gpt.configs"):
+        module_name = f"sample_efficient_gpt.configs.{module_name}"
+    module = importlib.import_module(module_name)
+    cfg = getattr(module, "cfg", None)
+    if cfg is None:
+        raise ValueError(f"Config module {module_name} does not define cfg")
+    return cfg
+
+
+def config_from_dict(config: dict[str, Any], base_cfg: Config = default_cfg) -> Config:
+    cfg = apply_overrides(base_cfg, flatten(config))
+    return Config(
+        data=DataConfig(**dataclass_to_nested_dict(cfg)["data"]),
+        model=ModelConfig(**dataclass_to_nested_dict(cfg)["model"]),
+        trainer=TrainerConfig(**dataclass_to_nested_dict(cfg)["trainer"]),
+        optim=OptimConfig(**dataclass_to_nested_dict(cfg)["optim"]),
+        project=config.get("project", cfg.project),
+    )
+
+
 def save_config(cfg: Config):
     return json.dumps(dataclass_to_nested_dict(cfg), default=str)
 
 
-def load_config(config_str: str):
-    cfg: Config = default_cfg
-    updated_cfg = apply_overrides(cfg, json.loads(config_str))
-    updated_cfg = Config(
-        data=DataConfig(**updated_cfg.data),
-        model=ModelConfig(**updated_cfg.model),
-        trainer=TrainerConfig(**updated_cfg.trainer),
-        optim=OptimConfig(**updated_cfg.optim),
-    )
-    return updated_cfg
+def load_config(config_like: str | dict[str, Any]):
+    if isinstance(config_like, str):
+        config_dict = json.loads(config_like)
+    elif isinstance(config_like, dict):
+        config_dict = config_like
+    else:
+        raise TypeError(f"Unsupported config type: {type(config_like)}")
+    return config_from_dict(config_dict)
+
+
+def load_config_from_yaml(path: str | Path, config_key: str | None = None) -> Config:
+    with open(path, "r") as f:
+        raw = yaml.safe_load(f) or {}
+    candidates: dict[str, Any] = raw.get("experiments", raw)
+    if config_key:
+        config_dict = candidates.get(config_key)
+        if config_dict is None:
+            raise KeyError(f"Config '{config_key}' not found in {path}")
+    else:
+        if isinstance(raw.get("experiments"), dict):
+            raise ValueError("config_key must be provided when the YAML file defines multiple experiments")
+        config_dict = candidates
+    if not isinstance(config_dict, dict):
+        raise TypeError(f"Invalid config structure in {path}, expected a mapping")
+    base_cfg = _load_base_cfg(config_dict.pop("base", raw.get("base", None)))
+    return config_from_dict(config_dict, base_cfg=base_cfg)
 
 
 def render_template(template: str, cfg, extra: dict[str, Any] | None = None) -> str:
