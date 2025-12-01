@@ -93,7 +93,7 @@ def load_optimizer(fpath: Path, cfg: Config, model, optimizers: list[Optimizer] 
                 )
     else:
         if optimizers is not None and optimizers[0] is not None:
-            if checkpoint["optimizer"] is None or (isinstance(checkpoint['optimizer'], list) and checkpoint["optimizer"][0] is None):
+            if checkpoint.get("optimizer") is None or (isinstance(checkpoint['optimizer'], list) and checkpoint["optimizer"][0] is None):
                 print("no optimizers detected in the checkpoint, skipping...")
                 return
             # for muon we load 2 optimizers

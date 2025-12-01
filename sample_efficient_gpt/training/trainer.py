@@ -159,6 +159,12 @@ class Trainer:
                 step=self.iteration,
             )
 
+        tokenizer_path = self.cfg.data.tokenizer_path
+        self.tokenizer = PreTrainedTokenizerFast.from_pretrained(tokenizer_path)
+        self.special_tokens_ids = torch.tensor(
+            [x for x in self.tokenizer.added_tokens_decoder if x < self.cfg.model.vocab_size]
+        )
+
         if load_components == "all":
             self._init_optimizers()
             if load_from is not None:
@@ -196,13 +202,6 @@ class Trainer:
 
         if compile:
             self.model.compile()
-
-        tokenizer_path = self.cfg.data.tokenizer_path
-        self.tokenizer = PreTrainedTokenizerFast.from_pretrained(tokenizer_path)
-        self.special_tokens_ids = torch.tensor(
-            [x for x in self.tokenizer.added_tokens_decoder if x < self.cfg.model.vocab_size]
-        )
-        self.mbbp_evaluator = SimpleMBPPEvaluator(dataset="lite", timeout=8.0)
 
         # Use per token bytes length for normalization in loss
         self.id2byte_len = torch.tensor(
@@ -582,12 +581,13 @@ class Trainer:
             if self.rank_zero_only:
                 if self.iteration % self.cfg.trainer.save_every == 0:
                     self.save_state()
-                run_eval = not os.getenv("NO_VAL", "0") == "1"
+                run_eval = self.val_dataset is not None and not os.getenv("NO_VAL", "0") == "1"
                 if run_eval and self.iteration > 0 and self.iteration % self.cfg.trainer.val_every == 0:
                     val_metrics = self.validate()
                     self.log(val_metrics)
 
             start = time.monotonic()
+            # targets are expected to be shifted by 1
             inputs, targets = self.train_dataset.get_batch(self.cfg.data.batch_size)
             device = self.cfg.trainer.device
             inputs, targets = inputs.to(device), targets.to(device)

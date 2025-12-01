@@ -100,7 +100,7 @@ def load_config(config_like: str | dict[str, Any]):
 
 
 def load_config_from_yaml(path: str | Path, config_key: str | None = None) -> Config:
-    with open(path, "r") as f:
+    with open(path) as f:
         raw = yaml.safe_load(f) or {}
     candidates: dict[str, Any] = raw.get("experiments", raw)
     if config_key:

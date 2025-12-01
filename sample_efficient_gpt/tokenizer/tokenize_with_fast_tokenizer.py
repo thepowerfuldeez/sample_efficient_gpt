@@ -1,5 +1,6 @@
 import math
 import time
+import os
 import logging
 import json
 from argparse import ArgumentParser
@@ -18,6 +19,22 @@ from sample_efficient_gpt.tokenizer.pretokenization import find_chunk_boundaries
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 disable_caching()
+
+if int(os.getenv("STAGE", "1")) == 2:
+    COSMOPEDIA_THRESHOLD = 2.3
+    FINEMATH_THRESHOLD = 4.1
+    DCLM_EDU_THRESHOLD = 3.2
+    STACK_EDU_THRESHOLD = 4.1
+    FINEPDFS_THRESHOLD = 2.1
+    PLEIAS_SYNTH_THRESHOLD = 1.85
+    print("Using thresholds from stage 2")
+else:
+    COSMOPEDIA_THRESHOLD = 2.0
+    FINEMATH_THRESHOLD = 3.7
+    DCLM_EDU_THRESHOLD = 2.75
+    STACK_EDU_THRESHOLD = 3.75
+    FINEPDFS_THRESHOLD = 1.75
+    PLEIAS_SYNTH_THRESHOLD = 1.65
 
 
 class TokenizerProcessor:
@@ -44,7 +61,8 @@ class TokenizerProcessor:
         jsonl_files = list(path.glob("*.jsonl.gz"))
         if parquet_files:
             for chunk_path in tqdm(parquet_files):
-                out_path = (tokenized_path / chunk_path.stem).with_suffix(".npy")
+                name = "".join(str(chunk_path.name).split(".")[:-1])
+                out_path = (tokenized_path / name).with_suffix(".npy")
                 if out_path.exists():
                     if limit > 0:
                         current_count += np.load(str(out_path), mmap_mode="r").shape[0]
@@ -63,11 +81,19 @@ class TokenizerProcessor:
                 # for dclm-edu
                 if "dclm-edu" in str(chunk_path):
                     ds = ds.filter(
-                        lambda ex: ex["metadata"]["edu_score"] > 2.75, num_proc=4, load_from_cache_file=False
+                        lambda ex: ex["metadata"]["edu_score"] > DCLM_EDU_THRESHOLD, num_proc=4, load_from_cache_file=False
                     )
                 # for finemath
                 if "finemath" in str(chunk_path):
-                    ds = ds.filter(lambda ex: ex["score"] > 3.7, num_proc=4, load_from_cache_file=False)
+                    ds = ds.filter(lambda ex: ex["score"] > FINEMATH_THRESHOLD, num_proc=4, load_from_cache_file=False)
+                if "cosmopedia-v2-textbook-7b" in str(chunk_path):
+                    ds = ds.filter(lambda ex: ex["score"] > COSMOPEDIA_THRESHOLD, num_proc=4, load_from_cache_file=False)
+                if "stack_edu_375plus_20B" in str(chunk_path):
+                    ds = ds.filter(lambda ex: ex["score"] > STACK_EDU_THRESHOLD, num_proc=4, load_from_cache_file=False)
+                if "finepdfs_en_2020plus_edu" in str(chunk_path):
+                    ds = ds.filter(lambda ex: ex["score"] > FINEPDFS_THRESHOLD, num_proc=4, load_from_cache_file=False)
+                if "pleias_synth" in str(chunk_path):
+                    ds = ds.filter(lambda ex: ex["score"] > PLEIAS_SYNTH_THRESHOLD, num_proc=4, load_from_cache_file=False)
 
                 if not "the_stack_v2_" in str(chunk_path):
                     ds = ds.map(
@@ -83,7 +109,7 @@ class TokenizerProcessor:
             # chunk_size = 50
             # for everything else
             chunk_size = 100
-            chunks = [jsonl_files[i : i + 50] for i in range(0, len(jsonl_files), chunk_size)]
+            chunks = [jsonl_files[i : i + chunk_size] for i in range(0, len(jsonl_files), chunk_size)]
             for i, chunk in tqdm(list(enumerate(chunks))):
                 if token_count is not None and current_count > token_count:
                     logger.info("reached limit")

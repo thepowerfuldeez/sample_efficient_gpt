@@ -16,6 +16,8 @@ dependencies = [
     "tiktoken>=0.9.0",
     "torch",
     "torchao",
+    "torchvision",
+    "triton",
     # "torch~=2.8.0; sys_platform != 'darwin' or platform_machine != 'x86_64'",
     # "torch~=2.2.2; sys_platform == 'darwin' and platform_machine == 'x86_64'", # Intel Macs
     "tqdm>=4.67.1",
@@ -29,11 +31,24 @@ dependencies = [
     "ipykernel>=6.30.1",
     "ruff>=0.13.2",
     "tokenizers>=0.22.1",
-    "transformers>=4.56.2",
+    "transformers",
     "prettytable>=3.16.0",
     "pandas>=2.3.3",
     "pyarrow",
+    "pyyaml>=6.0.2",
+    "safetensors>=0.4.5",
     "datasets==4.2.0",
+    "accelerate>=1.11.0",
+    "boto3>=1.40.74",
+    "awscli>=1.42.74",
+    "botocore>=1.40.74",
+    "datatrove>=0.6.0",
+    "matplotlib>=3.10.7",
+    "seaborn>=0.13.2",
+    "scipy>=1.16.3",
+    "setuptools-scm>=9.2.2",
+    "hf-transfer>=0.1.9",
+    "ipywidgets>=8.1.8",
 ]
 
 [build-system]
@@ -48,14 +63,21 @@ module-root = ""
 package = true
 python-preference = "managed"
 index-strategy = "unsafe-best-match"
+no-build-isolation = true
+override-dependencies = ["torch==2.10.0.dev20251117+cu130", "torchvision==0.25.0.dev20251117+cu130"]
 
 [tool.uv.sources]
 torch = [
   { index = "pytorch-cu130" },
 ]
+torchvision = [
+  { index = "pytorch-cu130" },
+]
 torchao = [
   { index = "pytorch-cu130" },
 ]
+vllm = { path = "../vllm", editable = true }
+transformers = { path = "../transformers", editable = true }
 fastsplit = { path = "sample_efficient_gpt/fastsplit", editable = true }
 
 [[tool.uv.index]]
@@ -81,3 +103,8 @@ ignore = [
     "F722",
     "UP037"
 ]
+
+
+[tool.uv.extra-build-dependencies]
+vllm = ["torch", "setuptools_scm"]
+sample-efficient-gpt = ["uv_build"]

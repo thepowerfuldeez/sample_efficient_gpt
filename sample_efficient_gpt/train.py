@@ -110,6 +110,8 @@ def train(rank, cfg: Config, args):
 if __name__ == "__main__":
     args = parse_args()
     cfg = load_cfg(args.config, args.config_key)
+    cfg.optim.lr = float(cfg.optim.lr)
+    cfg.optim.muon_lr = float(cfg.optim.muon_lr)
     if args.world_size > 1:
         dist.init_process_group(BACKEND)
         if BACKEND != "gloo":

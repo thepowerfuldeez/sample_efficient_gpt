@@ -141,7 +141,14 @@ def forward_model(model, input_ids):
     The last column of losses is set to nan because we don't have autoregressive targets there.
     """
     batch_size, seq_len = input_ids.size()
-    outputs, _ = model(input_ids)
+    out = model(input_ids)
+    if isinstance(out, tuple):
+        outputs, _ = out
+    # huggingface
+    elif hasattr(out, "logits"):
+        outputs = out.logits
+    else:
+        raise ValueError()
     # Roll the tensor to the left by one position to get the (autoregressive) target ids
     target_ids = torch.roll(input_ids, shifts=-1, dims=1)
     # Calculate cross entropy at all positions

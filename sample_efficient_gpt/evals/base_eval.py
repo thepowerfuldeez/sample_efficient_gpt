@@ -100,7 +100,35 @@ def parse_args():
     p = ArgumentParser()
     p.add_argument("--checkpoint")
     p.add_argument("--base_dir", default=Path("/home/george/.cache/sample_efficient_gpt"), type=Path)
+    p.add_argument("--results_dir", default=Path("/home/george/sample_efficient_gpt/evals/results"), type=Path)
+    p.add_argument("--type", default="se", help="se or hf")
     return p.parse_args()
+
+
+def get_model(checkpoint, device):
+    trainer = Trainer(load_from=checkpoint, load_components="infer", **{"trainer.device": device})
+    run_id = trainer.run_id
+    project = trainer.cfg.project
+    model = trainer.model
+    tokenizer = trainer.tokenizer
+    iteration = trainer.iteration
+    return model, tokenizer, run_id, project, iteration
+
+
+def get_model_hf(checkpoint="HuggingFaceTB/SmolLM2-360M", device="cuda"):
+    from transformers import AutoTokenizer, AutoModelForCausalLM
+
+    model = AutoModelForCausalLM.from_pretrained(
+        checkpoint,
+        device_map="cuda",
+        dtype=torch.bfloat16,
+        trust_remote_code=True,
+        # local_files_only=True,
+        # use_safetensors=False,
+        attn_implementation="flash_attention_2"
+    ).to(device)
+    tokenizer = AutoTokenizer.from_pretrained(checkpoint)
+    return model, tokenizer, "", "", 0
 
 
 # -----------------------------------------------------------------------------
@@ -112,16 +140,15 @@ def main():
     device = f"cuda:{rank}"
     args = parse_args()
 
-    trainer = Trainer(load_from=args.checkpoint, load_components="infer", **{"trainer.device": device})
-    run_id = trainer.run_id
-    project = trainer.cfg.project
-    model = trainer.model
-    tokenizer = trainer.tokenizer
+    if args.type == "hf":
+        model, tokenizer, run_id, project, iteration = get_model_hf(args.checkpoint, device)
+        model_slug = args.checkpoint.replace("/", "_").lower()
+    else:
+        model, tokenizer, run_id, project, iteration = get_model(args.checkpoint, device)
+        model_slug = f"base_model_{iteration:06d}"  # for the output csv file
     autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
     base_dir = args.base_dir
-
-    model_name = f"base_model (step {trainer.iteration})"  # just for logging
-    model_slug = f"base_model_{trainer.iteration:06d}"  # for the output csv file
+    results_dir = args.results_dir
 
     # Evaluate the model
     with autocast_ctx:
@@ -131,7 +158,7 @@ def main():
     core_metric = None
     centered_results = {}
     if rank == 0:
-        output_csv_path = base_dir / "base_eval" / f"{model_slug}.csv"
+        output_csv_path = results_dir / "base_eval" / f"{model_slug}.csv"
         os.makedirs(os.path.dirname(output_csv_path), exist_ok=True)
         results = out["results"]
         centered_results = out["centered_results"]
@@ -143,13 +170,14 @@ def main():
             f.write(f"{'CORE':<35}, {'':<10}, {core_metric:<10.6f}\n")
         # Print the content of the csv file to console too
         print0("=" * 80)
-        print0(f"Model: {model_name}")
+        print0(f"Model: {model_slug}")
         print0("=" * 80)
         with open(output_csv_path) as f:
             print0(f.read())
 
-        with wandb.init(project=project, resume="must", id=run_id) as run:
-            run.log({"eval/core_metric": core_metric})
+        if project and run_id:
+            with wandb.init(project=project, resume="must", id=run_id) as run:
+                run.log({"eval/core_metric": core_metric})
 
     # Log to report
     # from nanochat.report import get_report
