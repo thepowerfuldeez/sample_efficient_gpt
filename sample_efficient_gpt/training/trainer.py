@@ -21,7 +21,6 @@ from sample_efficient_gpt.training import (
     MemoryMappedDataset,
     AdamW,
     Muon,
-    Lion,
     get_cosine_lr,
     get_wsd_lr,
     get_seesaw_lr,
@@ -133,7 +132,11 @@ class Trainer:
 
                 assert isinstance(self.model, FSDPModule)
             # 749.5TFLOPS of compute in bf16 when using 4 gpus
-            self.available_flops = 749.5e12 * flops_multiplier
+            if self.world_size == 4:
+                self.available_flops = 749.5e12 * flops_multiplier
+            # 8 B200 gpus each having 2pFLOPs bf16 compute
+            elif self.world_size == 8:
+                self.available_flops = 2000e12 * flops_multiplier * self.world_size
         else:
             # 209.5TFLOPS of compute in bf16 when using 1 gpu
             self.available_flops = 209.5e12 * flops_multiplier

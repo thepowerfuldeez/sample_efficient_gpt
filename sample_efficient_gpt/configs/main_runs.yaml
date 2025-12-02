@@ -52,6 +52,34 @@ experiments:
     data:
       <<: *data_mix
 
+  main_run_mix_stable_continue:
+    <<: *base_experiment
+    trainer:
+      <<: *trainer_base
+      run_name: "{date}_main_run_mix"
+      gradient_accumulation_steps: 1
+      max_steps: 50000
+      save_every: 2500
+      val_every: 1000
+      # load_from: /root/imu1_base_ema.pt
+      load_from: /root/checkpoints/1202_main_run_mix/2500.pt
+      save_dir: /root/checkpoints/
+    optim:
+      <<: *optim_base
+      muon_lr: 1e-2
+      lr: 5e-3
+      wsd_need_warmup: true
+      wsd_phase: stable
+      warmup_steps: 1000
+    data:
+      <<: *data_mix
+      tokenizer_path: /root/.cache/huggingface/hub/models--thepowerfuldeez--imu_1_base/snapshots/f37099bbd98d1a33808ab59a71d31721da8bb543/
+      validation_path: /root/val.npy
+      train_path: /root/sample_efficient_gpt/sample_efficient_gpt/1202_main_run_data.json
+      context_length: 768
+      batch_size: 1024
+      val_batch_size: 16
+
   main_run_mix_decay:
     <<: *base_experiment
     trainer:

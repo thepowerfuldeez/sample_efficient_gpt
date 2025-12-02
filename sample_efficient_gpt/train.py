@@ -94,7 +94,14 @@ def train(rank, cfg: Config, args):
     cfg.trainer.save_dir = Path(cfg.trainer.save_dir)
     cfg.trainer.save_dir = cfg.trainer.save_dir / run_name
 
-    if (args.world_size > 1 and rank == 2) or (args.world_size == 1 and rank == 0):
+    if args.world_size == 4:
+        main_rank = (args.world_size > 1 and rank == 2) or (args.world_size == 1 and rank == 0)
+    elif args.world_size == 8:
+        main_rank = (rank == 0)
+    else:
+        main_rank = False
+
+    if main_rank:
         run = wandb.init(project=cfg.project, name=run_name, config=dataclass_to_nested_dict(cfg))
     else:
         run = None
