@@ -97,7 +97,7 @@ def train(rank, cfg: Config, args):
     if args.world_size == 4:
         main_rank = (args.world_size > 1 and rank == 2) or (args.world_size == 1 and rank == 0)
     elif args.world_size == 8:
-        main_rank = (rank == 0)
+        main_rank = rank == 0
     else:
         main_rank = False
 
@@ -108,7 +108,7 @@ def train(rank, cfg: Config, args):
     trainer = Trainer(cfg, load_from=args.load_from, wandb=run)
     trainer.train()
 
-    if (args.world_size > 1 and rank == 2) or (args.world_size == 1 and rank == 0):
+    if main_rank:
         run.finish()
     if args.world_size > 1:
         shutdown()
