@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from torch import Tensor
+from torch.utils.checkpoint import checkpoint
 from jaxtyping import Float, Int
 from tqdm.auto import tqdm
 
@@ -11,6 +12,26 @@ from sample_efficient_gpt.transformer.attention import MultiHeadSelfAttention, K
 from sample_efficient_gpt.utils.profiling import nvtx_range
 
 _MAX_SEQ_LEN = 8192
+
+
+class CheckpointBlock(nn.Module):
+    def __init__(self, block: nn.Module):
+        super().__init__()
+        self.block = block
+
+    def forward(self, x, *args, **kwargs):
+        def _forward(*inputs):
+            # re-pack if your block takes more than just x
+            return self.block(*inputs, **kwargs)
+
+        return checkpoint(_forward, x, *args)
+
+
+def apply_checkpointing_to_last_n_layers(model, n_last: int):
+    layers = model.transformer.blocks  # adapt to your naming
+    L = len(layers)
+    for i in range(L - n_last, L):
+        layers[i] = CheckpointBlock(layers[i])
 
 
 class Block(nn.Module):
@@ -78,10 +99,13 @@ class Transformer(nn.Module):
         device=None,
         dtype=None,
         weight_tying: bool = False,
+        num_grad_checkpoint_layers: int = 0,
     ):
         super().__init__()
         self.embedding = Embedding(vocab_size, d_model, device, dtype)
         self.n_layers = n_layers
+        # do activation checkpointing for first N layers
+        self.num_grad_checkpoint_layers = num_grad_checkpoint_layers
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -114,8 +138,18 @@ class Transformer(nn.Module):
         v1 = None
         for i, layer in enumerate(self.blocks):
             with nvtx_range(f"block {i}"):
-                # pass residual value
-                x, avg_kurtosis, v = layer(x, v1=v1, kv_cache=kv_cache[i] if kv_cache is not None else None)
+                if i < self.num_grad_checkpoint_layers:
+                    # checkpoint this block
+                    def layer_forward(x, v1, kv_cache):
+                        # IMPORTANT: capture block via closure, pass extra args through
+                        return layer(x, v1=v1, kv_cache=kv_cache)
+
+                    # use_reentrant=False plays nicer with torch.compile
+                    x, avg_kurtosis, v = checkpoint(
+                        layer_forward, x, v1, kv_cache[i] if kv_cache is not None else None, use_reentrant=False
+                    )
+                else:
+                    x, avg_kurtosis, v = layer(x, v1=v1, kv_cache=kv_cache[i] if kv_cache is not None else None)
             if v1 is None:
                 v1 = v
             avg_kurtosis_values[i] = avg_kurtosis
@@ -170,21 +204,6 @@ class Transformer(nn.Module):
                 if (out == eos_token_id).all(dim=-1).item():
                     break
         return output_seq, eos_probs
-
-    def forward_tp(self, x: Int[Tensor, "bs seq"]) -> Float[Tensor, "bs seq vocab_size"]:
-        x: Float[Tensor, "bs seq d_model"] = self.embedding(x)
-        prenorm_activation_norms: Float[Tensor, "n_layers"] = torch.zeros(
-            (len(self.blocks),), dtype=x.dtype, device=x.device
-        )
-        v1 = None
-        for i, layer in enumerate(self.blocks):
-            # pass residual value
-            x, prenorm_act_norm, v = layer(x, v1=v1)
-            if v1 is None:
-                v1 = v
-            prenorm_activation_norms[i] = prenorm_act_norm
-        x = self.final_norm(x)
-        return self.lm_head(x), prenorm_activation_norms
 
 
 if __name__ == "__main__":
