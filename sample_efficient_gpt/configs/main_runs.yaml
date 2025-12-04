@@ -80,6 +80,31 @@ experiments:
       batch_size: 1024
       val_batch_size: 16
 
+  main_run_mix_stable_continue2:
+    <<: *base_experiment
+    trainer:
+      <<: *trainer_base
+      run_name: "{date}_main_run_mix_continue"
+      gradient_accumulation_steps: 1
+      max_steps: 40000
+      save_every: 2500
+      val_every: 1000
+      load_from: /root/1300000.pt
+      save_dir: /root/checkpoints/
+    optim:
+      <<: *optim_base
+      muon_lr: 1.44e-2
+      wsd_need_warmup: false
+      wsd_phase: stable
+    data:
+      <<: *data_mix
+      tokenizer_path: /root/.cache/huggingface/hub/models--thepowerfuldeez--imu_1_base/snapshots/f37099bbd98d1a33808ab59a71d31721da8bb543/
+      validation_path: /root/val.npy
+      train_path: /root/sample_efficient_gpt/sample_efficient_gpt/1204_main_run_data.json
+      context_length: 704
+      batch_size: 640
+      val_batch_size: 16
+
   main_run_mix_decay:
     <<: *base_experiment
     trainer:
@@ -129,6 +154,33 @@ experiments:
       train_path: /root/sample_efficient_gpt/sample_efficient_gpt/1202_main_run_data_decay.json
       context_length: 1152
       batch_size: 768
+      val_batch_size: 16
+
+  main_run_mix_new_decay2:
+    <<: *base_experiment
+    trainer:
+      <<: *trainer_base
+      run_name: "{date}_main_run_mix_continue_decay"
+      gradient_accumulation_steps: 1
+      max_steps: 105000
+      save_every: 1000
+      val_every: 1000
+      load_from: /root/checkpoints/1204_main_run_mix/40000.pt
+      save_dir: /root/checkpoints/
+    optim:
+      <<: *optim_base
+      muon_lr: 1.32e-2
+      lr: 6.4e-3
+      wsd_need_warmup: false
+      wsd_phase: decay
+      wsd_decay_step: 40000
+    data:
+      <<: *data_mix
+      tokenizer_path: /root/.cache/huggingface/hub/models--thepowerfuldeez--imu_1_base/snapshots/f37099bbd98d1a33808ab59a71d31721da8bb543/
+      validation_path: /root/val.npy
+      train_path: /root/sample_efficient_gpt/sample_efficient_gpt/1202_main_run_data_decay.json
+      context_length: 1152
+      batch_size: 480
       val_batch_size: 16
 
   main_run_mix_midtrain_stable:
