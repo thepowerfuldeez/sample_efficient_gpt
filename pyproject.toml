@@ -64,7 +64,7 @@ package = true
 python-preference = "managed"
 index-strategy = "unsafe-best-match"
 no-build-isolation = true
-override-dependencies = ["torch==2.10.0.dev20251117+cu130", "torchvision==0.25.0.dev20251117+cu130"]
+override-dependencies = ["torch==2.10.0.dev20251203+cu130", "torchvision==0.25.0.dev20251203+cu130"]
 
 [tool.uv.sources]
 torch = [
