@@ -239,22 +239,29 @@ def evaluate_example(idx, model, tokenizer, data, device, task_meta):
     return is_correct
 
 
-def evaluate_task(model, tokenizer, data, device, task_meta):
+def evaluate_task(model, tokenizer, data, device, task_meta, batch_size: int = 8):
     """
     This function is responsible for evaluating one task across many examples.
     It also handles dispatch to all processes if the script is run with torchrun.
     """
     rank = dist.get_rank() if dist.is_initialized() else 0
     world_size = dist.get_world_size() if dist.is_initialized() else 1
-    correct = torch.zeros(len(data), dtype=torch.float32, device=device)
-    # stride the examples to each rank
-    for idx in range(rank, len(data), world_size):
-        is_correct = evaluate_example(idx, model, tokenizer, data, device, task_meta)
-        correct[idx] = float(is_correct)
+    indices = list(range(rank, len(data), world_size))
+    local_correct = 0.0
+    for start in range(0, len(indices), batch_size):
+        end = min(start + batch_size, len(indices))
+        for idx in indices[start:end]:
+            is_correct = evaluate_example(idx, model, tokenizer, data, device, task_meta)
+            local_correct += float(is_correct)
+    local_total = float(len(indices))
+
+    correct_tensor = torch.tensor(local_correct, device=device)
+    total_tensor = torch.tensor(local_total, device=device)
     # sync results across all the processes if running distributed
     if world_size > 1:
         dist.barrier()
-        dist.all_reduce(correct, op=dist.ReduceOp.SUM)
+        dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
+        dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)
     # compute the mean
-    mean_correct = correct.mean().item()
+    mean_correct = (correct_tensor / total_tensor).item() if total_tensor.item() > 0 else 0.0
     return mean_correct

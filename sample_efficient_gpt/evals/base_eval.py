@@ -33,7 +33,7 @@ def print0(*args, **kwargs):
         print(*args, **kwargs)
 
 
-def evaluate_model(base_dir: Path, model, tokenizer, device, max_per_task=-1):
+def evaluate_model(base_dir: Path, model, tokenizer, device, max_per_task=-1, batch_size: int = 8):
     """
     Evaluate a base model on the CORE benchmark.
     - max_per_task: crop the data to this many examples per task for testing (-1 = disable)
@@ -75,7 +75,7 @@ def evaluate_model(base_dir: Path, model, tokenizer, device, max_per_task=-1):
             data = data[:max_per_task]
 
         # run the evaluation for this task
-        accuracy = evaluate_task(model, tokenizer, data, device, task_meta)
+        accuracy = evaluate_task(model, tokenizer, data, device, task_meta, batch_size=batch_size)
 
         results[label] = accuracy
         row = eval_metadata[eval_metadata["Eval Task"] == label]
@@ -102,11 +102,16 @@ def parse_args():
     p.add_argument("--base_dir", default=Path("/home/george/.cache/sample_efficient_gpt"), type=Path)
     p.add_argument("--results_dir", default=Path("/home/george/sample_efficient_gpt/evals/results"), type=Path)
     p.add_argument("--type", default="se", help="se or hf")
+    p.add_argument("--batch", type=int, default=8, help="per-rank eval batch size")
     return p.parse_args()
 
 
 def get_model(checkpoint, device):
-    trainer = Trainer(load_from=checkpoint, load_components="infer", **{"trainer.device": device})
+    trainer = Trainer(
+        load_from=checkpoint,
+        load_components="infer",
+        **{"trainer.device": device, "data.tokenizer_path": "thepowerfuldeez/imu_1_base"},
+    )
     run_id = trainer.run_id
     project = trainer.cfg.project
     model = trainer.model
@@ -125,7 +130,7 @@ def get_model_hf(checkpoint="HuggingFaceTB/SmolLM2-360M", device="cuda"):
         trust_remote_code=True,
         # local_files_only=True,
         # use_safetensors=False,
-        attn_implementation="flash_attention_2"
+        attn_implementation="flash_attention_2",
     ).to(device)
     tokenizer = AutoTokenizer.from_pretrained(checkpoint)
     return model, tokenizer, "", "", 0
@@ -152,13 +157,13 @@ def main():
 
     # Evaluate the model
     with autocast_ctx:
-        out = evaluate_model(base_dir, model, tokenizer, device)
+        out = evaluate_model(base_dir, model, tokenizer, device, batch_size=args.batch)
 
     # Write out the results to a csv file
     core_metric = None
     centered_results = {}
     if rank == 0:
-        output_csv_path = results_dir / "base_eval" / f"{model_slug}.csv"
+        output_csv_path = results_dir / "base_eval_continue" / f"{model_slug}.csv"
         os.makedirs(os.path.dirname(output_csv_path), exist_ok=True)
         results = out["results"]
         centered_results = out["centered_results"]
@@ -177,7 +182,13 @@ def main():
 
         if project and run_id:
             with wandb.init(project=project, resume="must", id=run_id) as run:
-                run.log({"eval/core_metric": core_metric})
+                run.define_metric(step_metric="iteration", name="eval/core_metric")
+                log_dict = {
+                    "iteration": iteration,
+                    "eval/core_metric": core_metric,
+                }
+
+                run.log(log_dict)
 
     # Log to report
     # from nanochat.report import get_report

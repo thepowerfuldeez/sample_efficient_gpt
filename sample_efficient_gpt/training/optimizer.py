@@ -45,7 +45,8 @@ class AdamW(torch.optim.Optimizer):
     def step(self, closure: Any | None = None):
         loss = None if closure is None else closure()
         # total_update_sq, total_weight_sq = 0.0, 0.0
-        update_rms = torch.tensor(0.0, dtype=torch.float32, device=self.param_groups[0]["params"][0].device)
+        device = self.param_groups[0]["params"][0].device
+        update_rms = torch.tensor(0.0, dtype=torch.float32, device=device)
         for group in self.param_groups:
             lr = group["lr"]
             beta1, beta2 = group["betas"]
@@ -66,25 +67,49 @@ class AdamW(torch.optim.Optimizer):
                     print(f"[t={t}] adamw grad is nan!", p)
                     grad[torch.isnan(grad)] = 0.0
 
-                m: Tensor = beta1 * m + (1 - beta1) * grad
-                v: Tensor = beta2 * v + (1 - beta2) * torch.square(grad)
-                bias_correction_term: float = math.sqrt(1 - beta2**t) / (1 - beta1**t)
+                # wd
+                p.data.mul_(1 - lr * wd)
 
-                # ! wd is decoupled, it should go first !
-                wd_delta = -lr * wd * p.data
-                adam_delta = -lr * bias_correction_term * m / (torch.sqrt(v) + eps)
-                delta = wd_delta + adam_delta
+                # m = beta1 * m + (1 - beta1) * grad
+                m.mul_(beta1).add_(grad, alpha=1 - beta1)
 
-                # total_update_sq += (delta.float().norm() ** 2).item()
-                # total_weight_sq += (p.data.float().norm() ** 2).item()
+                # v = beta2 * v + (1 - beta2) * grad^2
+                v.mul_(beta2).addcmul_(grad, grad, value=(1 - beta2))
 
-                update_rms += (delta * delta).mean()
+                # Bias correction
+                bias_correction1 = 1 - beta1**t
+                bias_correction2 = 1 - beta2**t
 
-                p.data.add_(delta)
+                # Compute step size
+                step_size = lr * (bias_correction2**0.5) / bias_correction1
+
+                # denom = sqrt(v) + eps
+                denom = v.sqrt().add_(eps)
+
+                # Parameter update: p -= step_size * (m / denom)
+                p.data.addcdiv_(m, denom, value=-step_size)
+
+                # m: Tensor = beta1 * m + (1 - beta1) * grad
+                # v: Tensor = beta2 * v + (1 - beta2) * torch.square(grad)
+                # bias_correction_term: float = math.sqrt(1 - beta2**t) / (1 - beta1**t)
+
+                # # ! wd is decoupled, it should go first !
+                # wd_delta = -lr * wd * p.data
+                # adam_delta = -lr * bias_correction_term * m / (torch.sqrt(v) + eps)
+                # delta = wd_delta + adam_delta
+
+                # # total_update_sq += (delta.float().norm() ** 2).item()
+                # # total_weight_sq += (p.data.float().norm() ** 2).item()
+
+                # update_rms += (delta * delta).mean()
+
+                # p.data.add_(delta)
+
                 state["t"] = t + 1
                 state["m"] = m
                 state["v"] = v
-        return update_rms.sqrt()
+        # return update_rms.sqrt()
+        return torch.tensor(0.0, device=device)
 
 
 def get_cosine_lr(t: int, lr_max: float, lr_min: float, warmup_steps: int, cosine_steps: int) -> float:

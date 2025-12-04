@@ -64,8 +64,10 @@ class Muon(torch.optim.Optimizer):
     @nvtx_range("muon step")
     @torch.no_grad()
     def step(self, closure: Any | None = None):
-        update_rms = torch.tensor(0.0, dtype=torch.float32, device=self.param_groups[0]["params"][0].device)
         n = 0
+        device = self.param_groups[0]["params"][0].device
+        update_rms = torch.zeros((), dtype=torch.float32, device=device)
+
         for group in self.param_groups:
             params: list[Tensor] = group["params"]
             momentum = group["momentum"]
@@ -102,10 +104,10 @@ class Muon(torch.optim.Optimizer):
                 momentum_buffer.lerp_(grad, 1 - momentum)
                 grad = grad.lerp_(momentum_buffer, momentum)
 
-                v = newton_schulz_triton(grad.bfloat16()).float()
+                v = newton_schulz_triton(grad.bfloat16()).to(torch.float32)
 
                 v_norm = normuon_update(p, v, second_momentum_buffer, eff_lr, eff_weight_decay, beta2)
                 # v_norm = normuon_triton_update(p, v, second_momentum_buffer, eff_lr, eff_weight_decay, beta2)
-                update_rms += v_norm * v_norm
+                update_rms.add_(v_norm * v_norm)
                 n += 1
         return update_rms.sqrt() / (n + 1e-10)

@@ -4,6 +4,8 @@ from torch import Tensor
 from jaxtyping import Float, Int
 
 from sample_efficient_gpt.utils.profiling import nvtx_range
+from sample_efficient_gpt.transformer.ops.rms_norm import LigerRMSNormFunction
+from sample_efficient_gpt.transformer.ops.silu import LigerSiLUMulFunction
 
 
 class Linear(nn.Module):
@@ -85,6 +87,7 @@ class SwiGLU(nn.Module):
         projected: Float[Tensor, "... 2*d_ff"] = self.up(x)
         left, right = projected.chunk(2, dim=-1)
         return self.down(torch.nn.functional.silu(left) * right)
+        # return self.down(LigerSiLUMulFunction.apply(left, right))
 
 
 def softmax(x: Tensor, dim: int = 0, temperature: float = 1.0) -> Tensor:
