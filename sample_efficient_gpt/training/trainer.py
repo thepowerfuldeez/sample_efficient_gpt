@@ -32,7 +32,7 @@ from sample_efficient_gpt.config_schema import Config
 from sample_efficient_gpt.utils.logger import logger
 from sample_efficient_gpt.utils.config_tools import load_config, apply_overrides
 
-from sample_efficient_gpt.training.distributed import DDP, ShardedOptimizer
+from sample_efficient_gpt.training.distributed import DDP
 
 from sample_efficient_gpt.evals.mbpp_eval import SimpleMBPPEvaluator
 

@@ -134,27 +134,27 @@ experiments:
       <<: *trainer_base
       run_name: "{date}_main_run_mix_decay"
       gradient_accumulation_steps: 1
-      max_steps: 87500
+      max_steps: 1345000
       save_every: 500
       val_every: 1000
-      # load_from: /root/imu1_base_ema.pt
-      load_from: /root/checkpoints/1202_main_run_mix/42500.pt
+      load_from: /root/1300000.pt
       save_dir: /root/checkpoints/
     optim:
       <<: *optim_base
-      muon_lr: 9.7e-3
-      lr: 4.85e-3
+      muon_lr: 3e-3
+      lr: 1e-3
       wsd_need_warmup: false
       wsd_phase: decay
-      wsd_decay_step: 42500
+      wsd_decay_step: 1300000
     data:
       <<: *data_mix
-      tokenizer_path: /root/.cache/huggingface/hub/models--thepowerfuldeez--imu_1_base/snapshots/f37099bbd98d1a33808ab59a71d31721da8bb543/
+      tokenizer_path: thepowerfuldeez/imu_1_base
       validation_path: /root/val.npy
       train_path: /root/sample_efficient_gpt/sample_efficient_gpt/1202_main_run_data_decay.json
       context_length: 1152
       batch_size: 768
       val_batch_size: 16
+      seed: 43
 
   main_run_mix_new_decay2:
     <<: *base_experiment
