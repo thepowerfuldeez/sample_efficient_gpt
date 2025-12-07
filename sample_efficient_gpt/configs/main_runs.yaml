@@ -134,8 +134,8 @@ experiments:
       <<: *trainer_base
       run_name: "{date}_main_run_mix_decay"
       gradient_accumulation_steps: 1
-      max_steps: 1345000
-      save_every: 500
+      max_steps: 1375000
+      save_every: 1000
       val_every: 1000
       load_from: /root/1300000.pt
       save_dir: /root/checkpoints/
