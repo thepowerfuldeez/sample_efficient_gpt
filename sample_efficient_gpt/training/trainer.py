@@ -120,6 +120,7 @@ class Trainer:
             moe_z_loss_coef=self.cfg.model.moe_z_loss_coef,
             moe_router_jitter=self.cfg.model.moe_router_jitter,
             moe_normalize_gates=self.cfg.model.moe_normalize_gates,
+            moe_gate_scale=self.cfg.model.moe_gate_scale,
             moe_expert_parallel_size=self.cfg.model.moe_expert_parallel_size,
             moe_expert_precision=self.cfg.model.moe_expert_precision,
             moe_start_layer=self.cfg.model.moe_start_layer,
