@@ -49,6 +49,7 @@ dependencies = [
     "setuptools-scm>=9.2.2",
     "hf-transfer>=0.1.9",
     "ipywidgets>=8.1.8",
+    "uv_build",
 ]
 
 [build-system]
@@ -64,7 +65,7 @@ package = true
 python-preference = "managed"
 index-strategy = "unsafe-best-match"
 no-build-isolation = true
-override-dependencies = ["torch==2.10.0.dev20251206+cu130", "torchvision==0.25.0.dev20251206+cu130"]
+override-dependencies = ["torch==2.11.0.dev20251217+cu130", "torchvision==0.25.0.dev20251217+cu130", "torchao==0.16.0.dev20251217+cu130"]
 
 [tool.uv.sources]
 torch = [

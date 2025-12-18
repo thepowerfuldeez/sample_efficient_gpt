@@ -129,6 +129,7 @@ experiments:
       attn_qknorm: true
       attn_gating: per-head
       attn_val_residual: true
+      moe_gate_scale: 5.0
       moe_num_experts: 48
       moe_top_k: 1
       moe_capacity_factor: 1.25

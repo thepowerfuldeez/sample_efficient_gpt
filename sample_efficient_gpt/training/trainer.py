@@ -250,11 +250,11 @@ class Trainer:
             self.model.eval()
             self.optimizers = None
 
-        # Torch compile is brittle with dynamic all-to-all token dispatch in EP MoE (shapes change step-to-step).
-        # In practice this can lead to excessive recompiles and/or hangs across ranks during validation.
-        if self.using_expert_parallel and compile:
-            logger.warning("Disabling torch.compile because expert-parallel MoE is enabled.")
-            compile = False
+        # # Torch compile is brittle with dynamic all-to-all token dispatch in EP MoE (shapes change step-to-step).
+        # # In practice this can lead to excessive recompiles and/or hangs across ranks during validation.
+        # if self.using_expert_parallel and compile:
+        #     logger.warning("Disabling torch.compile because expert-parallel MoE is enabled.")
+        #     compile = False
 
         if self.cfg.optim.scheduler == "wsd" and self.cfg.optim.wsd_phase == "decay":
             self.start_decay_step = self.cfg.optim.wsd_decay_step or self.iteration
@@ -772,6 +772,7 @@ class Trainer:
                         "train/step_comm_time": step_stats["time_comm"],
                         "train/tokens_processed": self.tokens_processed,
                         "train/mfu": step_stats["mfu"],
+                        "train/moe": {k: v for k, v in step_stats.items() if k.startswith("moe")},
                         **kurtosis_log,
                         **pnorm_log,
                     }

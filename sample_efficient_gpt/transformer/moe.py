@@ -152,6 +152,7 @@ class TopKMoE(nn.Module):
                 setattr(p, "_expert_parallel", True)
         self._fp8_converted = True
 
+    @torch.compile(disable=True)
     def _aux_loss(self, router_logits: Tensor, router_probs: Tensor, top1_idx: Tensor) -> Tensor:
         if self.aux_loss_coef == 0.0 and self.z_loss_coef == 0.0:
             return torch.zeros((), device=router_logits.device, dtype=router_logits.dtype)
