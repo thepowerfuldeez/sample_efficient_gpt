@@ -86,6 +86,8 @@ def train(rank, cfg: Config, args):
         run_name: str = wandb_run_name(cfg)[:47]
         if summary_suffix:
             run_name = f"{run_name}_{summary_suffix}"
+    # Make run_name safe as a path component (override values may include '/' etc).
+    run_name = run_name.replace("/", "_").replace("\\", "_").replace(" ", "_")
     logger.info(f"Training run: {run_name}")
 
     cfg = apply_overrides(cfg, override)

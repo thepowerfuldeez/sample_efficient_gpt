@@ -300,6 +300,7 @@ def _convert(
     moe_end_layer: int | None,
     moe_expert_init: Literal["copy", "permute"],
     moe_permute_seed: int,
+    moe_router_bias_init: float,
 ) -> None:
     hf_cfg = AutoConfig.from_pretrained(hf_dir)
     hf_model = AutoModelForCausalLM.from_pretrained(hf_dir, dtype=torch.float32, device_map={"": "cpu"})
@@ -493,9 +494,13 @@ def _convert(
             if moe_num_experts <= 0:
                 raise ValueError("Target model has MoE layers but moe_num_experts <= 0.")
 
-            # Initialize router to zeros: softmax is uniform, and argmax ties route to expert 0.
+            # Initialize router to route (almost) everything to expert 0 without capacity drops.
+            # This makes the converted MoE checkpoint close to function-preserving at step 0.
             out_sd[f"{imu_prefix}.ffn.router.weight"] = torch.zeros_like(out_sd[f"{imu_prefix}.ffn.router.weight"])
-            out_sd[f"{imu_prefix}.ffn.router.bias"] = torch.zeros_like(out_sd[f"{imu_prefix}.ffn.router.bias"])
+            bias = torch.zeros_like(out_sd[f"{imu_prefix}.ffn.router.bias"])
+            if bias.numel() > 0 and moe_router_bias_init != 0.0:
+                bias[0] = float(moe_router_bias_init)
+            out_sd[f"{imu_prefix}.ffn.router.bias"] = bias
 
             up0_key = f"{imu_prefix}.ffn.experts.0.ffn.up.linear.weight"
             down0_key = f"{imu_prefix}.ffn.experts.0.ffn.down.linear.weight"
@@ -746,6 +751,12 @@ def main() -> None:
         help="How to initialize experts from the dense MLP: exact copies or function-preserving permutations.",
     )
     p.add_argument("--moe-permute-seed", type=int, default=0, help="Seed for expert permutations (if moe-expert-init=permute).")
+    p.add_argument(
+        "--moe-router-bias-init",
+        type=float,
+        default=0.0,
+        help="If nonzero, adds this bias to expert 0's router logit (helps function-preserving upcycling).",
+    )
 
     args = p.parse_args()
 
@@ -835,6 +846,7 @@ def main() -> None:
         moe_end_layer=args.moe_end_layer,
         moe_expert_init=args.moe_expert_init,
         moe_permute_seed=args.moe_permute_seed,
+        moe_router_bias_init=args.moe_router_bias_init,
     )
 
 

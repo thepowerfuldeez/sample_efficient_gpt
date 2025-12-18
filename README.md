@@ -95,3 +95,6 @@ Useful perf toggles (environment variables):
 - `SEGPT_SWIGLU_IMPL=liger` (fused SiLU*mul inside SwiGLU)
 - `SEGPT_ATTN_IMPL=triton` / `SEGPT_QKNORM_ATTN_IMPL=triton` (Triton attention kernels)
 - `SEGPT_TRACK_KURTOSIS=0` (disable kurtosis computation)
+
+### B200 quickstart
+- `docs/B200_QUICKSTART.md`

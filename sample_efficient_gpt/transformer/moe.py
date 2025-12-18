@@ -50,8 +50,8 @@ class TopKMoE(nn.Module):
             raise ValueError("num_experts must be > 0")
         if top_k <= 0 or top_k > num_experts:
             raise ValueError("top_k must be in [1, num_experts]")
-        if capacity_factor <= 0:
-            raise ValueError("capacity_factor must be > 0")
+        if capacity_factor < 0:
+            raise ValueError("capacity_factor must be >= 0 (0 disables capacity drops)")
         if expert_parallel_size <= 0:
             raise ValueError("expert_parallel_size must be > 0")
 
@@ -201,8 +201,11 @@ class TopKMoE(nn.Module):
 
         if not self._ep_enabled:
             tokens_per_expert = tokens if self.top_k == 1 else tokens * self.top_k
-            capacity = int(math.ceil(self.capacity_factor * (tokens_per_expert / self.num_experts)))
-            capacity = max(1, capacity)
+            if self.capacity_factor == 0.0:
+                capacity = tokens_per_expert
+            else:
+                capacity = int(math.ceil(self.capacity_factor * (tokens_per_expert / self.num_experts)))
+                capacity = max(1, capacity)
 
             if self.top_k == 1:
                 x_rep = x_flat
@@ -245,11 +248,17 @@ class TopKMoE(nn.Module):
         local_expert = (expert_idx % num_local).to(torch.int64)
 
         # Capacity is defined in terms of tokens-per-expert across the *global* batch.
-        tok = torch.tensor([tokens], device=x.device, dtype=torch.int64)
-        dist.all_reduce(tok, op=dist.ReduceOp.SUM)
-        tokens_global = int(tok.item())
-        capacity = int(math.ceil(self.capacity_factor * (tokens_global / self.num_experts)))
-        capacity = max(1, capacity)
+        if self.capacity_factor == 0.0:
+            tok = torch.tensor([tokens], device=x.device, dtype=torch.int64)
+            dist.all_reduce(tok, op=dist.ReduceOp.SUM)
+            tokens_global = int(tok.item())
+            capacity = max(1, tokens_global)
+        else:
+            tok = torch.tensor([tokens], device=x.device, dtype=torch.int64)
+            dist.all_reduce(tok, op=dist.ReduceOp.SUM)
+            tokens_global = int(tok.item())
+            capacity = int(math.ceil(self.capacity_factor * (tokens_global / self.num_experts)))
+            capacity = max(1, capacity)
 
         perm = torch.argsort(dst_rank)
         dst_rank_sorted = dst_rank[perm]
