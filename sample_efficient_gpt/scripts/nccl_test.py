@@ -114,5 +114,5 @@ def distributed_demo(rank, world_size):
 
 
 if __name__ == "__main__":
-    world_size = 3
+    world_size = 8
     mp.spawn(fn=distributed_demo, args=(world_size,), nprocs=world_size, join=True)

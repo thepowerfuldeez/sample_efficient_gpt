@@ -134,54 +134,55 @@ experiments:
       <<: *trainer_base
       run_name: "{date}_main_run_mix_decay"
       gradient_accumulation_steps: 1
-      max_steps: 87500
-      save_every: 500
+      max_steps: 1365000
+      save_every: 1000
       val_every: 1000
-      # load_from: /root/imu1_base_ema.pt
-      load_from: /root/checkpoints/1202_main_run_mix/42500.pt
-      save_dir: /root/checkpoints/
+      # load_from: /root/1300000.pt
+      load_from: /dev/shm/checkpoints/1208_main_run_mix_decay/1318000.pt
+      save_dir: /dev/shm/checkpoints/
     optim:
       <<: *optim_base
-      muon_lr: 9.7e-3
-      lr: 4.85e-3
+      muon_lr: 2.6e-3
+      lr: 8.5e-4
       wsd_need_warmup: false
       wsd_phase: decay
-      wsd_decay_step: 42500
+      wsd_decay_step: 1300000
     data:
       <<: *data_mix
-      tokenizer_path: /root/.cache/huggingface/hub/models--thepowerfuldeez--imu_1_base/snapshots/f37099bbd98d1a33808ab59a71d31721da8bb543/
-      validation_path: /root/val.npy
-      train_path: /root/sample_efficient_gpt/sample_efficient_gpt/1202_main_run_data_decay.json
+      tokenizer_path: thepowerfuldeez/imu_1_base
+      validation_path: /dev/shm/val.npy
+      train_path: /dev/shm/sample_efficient_gpt/sample_efficient_gpt/1202_main_run_data_decay.json
       context_length: 1152
-      batch_size: 768
+      batch_size: 1024
       val_batch_size: 16
+      seed: 43
 
-  main_run_mix_new_decay2:
+  main_run_mix_new_midtrain:
     <<: *base_experiment
     trainer:
       <<: *trainer_base
-      run_name: "{date}_main_run_mix_continue_decay"
-      gradient_accumulation_steps: 1
-      max_steps: 105000
+      run_name: "{date}_main_run_mix_midtrain"
+      max_steps: 7000
       save_every: 1000
       val_every: 1000
-      load_from: /root/checkpoints/1204_main_run_mix/40000.pt
-      save_dir: /root/checkpoints/
+      load_from: /dev/shm/checkpoints/1208_main_run_mix_decay/1365000_ema_reset.pt
+      # load_from: /dev/shm/checkpoints/1208_main_run_mix_midtrain/2000.pt
+      save_dir: /dev/shm/checkpoints/
     optim:
-      <<: *optim_base
-      muon_lr: 1.32e-2
-      lr: 6.4e-3
-      wsd_need_warmup: false
-      wsd_phase: decay
-      wsd_decay_step: 40000
+      scheduler: cosine
+      muon_wd: 0.1
+      muon_lr: 2e-4
+      lr: 3e-5
+      warmup_steps: 500
+      lr_min_coeff: 0.1
     data:
-      <<: *data_mix
-      tokenizer_path: /root/.cache/huggingface/hub/models--thepowerfuldeez--imu_1_base/snapshots/f37099bbd98d1a33808ab59a71d31721da8bb543/
-      validation_path: /root/val.npy
-      train_path: /root/sample_efficient_gpt/sample_efficient_gpt/1202_main_run_data_decay.json
-      context_length: 1152
-      batch_size: 480
+      tokenizer_path: thepowerfuldeez/imu_1_base
+      validation_path: /dev/shm/val.npy
+      train_path: /dev/shm/sample_efficient_gpt/sample_efficient_gpt/1208_main_run_data_stage3.json
+      context_length: 2048
+      batch_size: 576
       val_batch_size: 16
+      seed: 43
 
   main_run_mix_midtrain_stable:
     <<: *base_experiment
