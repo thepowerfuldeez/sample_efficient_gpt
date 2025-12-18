@@ -17,6 +17,7 @@ from transformers import PreTrainedTokenizerFast
 from sample_efficient_gpt.transformer import Transformer
 from sample_efficient_gpt.training import (
     load_model,
+    load_model_expert_parallel,
     load_optimizer,
     save_checkpoint,
     MemoryMappedDataset,
@@ -91,6 +92,7 @@ class Trainer:
             logger.info("Loading from config")
             self.cfg = cfg
         self.using_sft = self.cfg.data.mode == "sft"
+        self.using_expert_parallel = int(self.cfg.model.moe_expert_parallel_size) > 1
         self.iteration = 0
         self.wandb = wandb
 
@@ -118,6 +120,8 @@ class Trainer:
             moe_z_loss_coef=self.cfg.model.moe_z_loss_coef,
             moe_router_jitter=self.cfg.model.moe_router_jitter,
             moe_normalize_gates=self.cfg.model.moe_normalize_gates,
+            moe_expert_parallel_size=self.cfg.model.moe_expert_parallel_size,
+            moe_expert_precision=self.cfg.model.moe_expert_precision,
             moe_start_layer=self.cfg.model.moe_start_layer,
             moe_every_n_layers=self.cfg.model.moe_every_n_layers,
             moe_end_layer=self.cfg.model.moe_end_layer,
@@ -126,6 +130,11 @@ class Trainer:
         load_from = load_from or self.cfg.trainer.load_from
         if load_from is not None:
             self.load_state(load_from, model_only=True)
+
+        # If requested, convert only MoE experts to float8 before DDP/optimizer init.
+        # Doing this lazily during forward can break optimizer parameter references.
+        if hasattr(self.model, "maybe_convert_moe_experts_to_fp8"):
+            self.model.maybe_convert_moe_experts_to_fp8()
 
         # maximum achievable is 90% for bf16; 80% for fp8
         flops_multiplier = 0.9 if not self.cfg.trainer.use_fp8 else 1.6
@@ -140,6 +149,9 @@ class Trainer:
             # 8 B200 gpus each having 2pFLOPs bf16 compute
             elif self.world_size == 8:
                 self.available_flops = 2000e12 * flops_multiplier * self.world_size
+            else:
+                # Best-effort fallback to avoid crashing on other world sizes.
+                self.available_flops = 209.5e12 * flops_multiplier * self.world_size
         else:
             # 209.5TFLOPS of compute in bf16 when using 1 gpu
             self.available_flops = 209.5e12 * flops_multiplier
@@ -323,20 +335,41 @@ class Trainer:
     def load_state(self, path: Path, model_only=True, optimizers_only=False):
         logger.info(f"Loading {model_only=} state from {str(path)}")
         if optimizers_only:
+            if self.using_expert_parallel:
+                raise ValueError("Loading optimizer state is not supported with expert-parallel MoE yet.")
             return load_optimizer(path, self.cfg, getattr(self.model, "module", self.model), self.optimizers)
-        self.iteration, self.run_id = load_model(path, self.cfg, getattr(self.model, "module", self.model))
+        if self.using_expert_parallel and self.is_distributed:
+            shard_path = path.with_name(f"{path.stem}.rank{self.rank}{path.suffix}")
+            load_path = shard_path if shard_path.exists() else path
+            self.iteration, self.run_id = load_model_expert_parallel(
+                load_path,
+                self.cfg,
+                getattr(self.model, "module", self.model),
+                rank=self.rank,
+                world_size=self.world_size,
+            )
+        else:
+            self.iteration, self.run_id = load_model(path, self.cfg, getattr(self.model, "module", self.model))
         logger.info(f"Restored {self.iteration} iteration")
         return self.iteration
 
     def save_state(self):
         logger.info(f"Saving training state at iter={self.iteration}")
+        shard_type = None
+        fpath = self.save_dir / f"{self.iteration}.pt"
+        if self.using_expert_parallel and self.is_distributed:
+            shard_type = "expert_parallel"
+            fpath = self.save_dir / f"{self.iteration}.rank{self.rank}.pt"
         save_checkpoint(
-            self.save_dir / f"{self.iteration}.pt",
+            fpath,
             self.cfg,
             getattr(self.model, "module", self.model),
             self.optimizers,
             iteration=self.iteration,
             run_id=self.wandb.id if self.wandb is not None else None,
+            rank=self.rank if self.is_distributed else None,
+            world_size=self.world_size if self.is_distributed else None,
+            shard_type=shard_type,
         )
 
     def log(self, data, rank_zero=True):
@@ -543,6 +576,21 @@ class Trainer:
             for opt in self.optimizers:
                 update_ratio = opt.step()
                 update_ratios.append(update_ratio)
+
+            # Aggregate scalar optimizer stats across ranks (all ranks must participate).
+            if self.is_distributed:
+                averaged = []
+                for ur in update_ratios:
+                    if ur is None:
+                        averaged.append(None)
+                        continue
+                    if not torch.is_tensor(ur):
+                        ur = torch.tensor(ur, device=self.cfg.trainer.device, dtype=torch.float32)
+                    ur = ur.to(dtype=torch.float32)
+                    dist.all_reduce(ur, op=dist.ReduceOp.SUM)
+                    ur = ur / float(self.world_size)
+                    averaged.append(ur)
+                update_ratios = averaged
             for opt in self.optimizers:
                 opt.zero_grad(set_to_none=True)
         else:
@@ -599,11 +647,6 @@ class Trainer:
         }
         ga_steps = max(1, int(self.cfg.trainer.gradient_accumulation_steps))
         is_accum_boundary = ((self.iteration + 1) % ga_steps) == 0
-        if self.is_distributed and is_accum_boundary:
-            for k in ["opt_0_update_ratio", "opt_1_update_ratio"]:
-                update_ratios = torch.zeros(self.world_size, device=step_stats[k].device, dtype=step_stats[k].dtype)
-                dist.all_gather_into_tensor(update_ratios, step_stats[k])
-                log_processed[k] = update_ratios.mean().item()
         # take any other key as it is
         return {
             **log_processed,
@@ -613,9 +656,14 @@ class Trainer:
     def train(self):
         logger.info("Starting training loop")
         while self.iteration < self.cfg.trainer.max_steps:
-            if self.rank_zero_only:
-                if self.iteration % self.cfg.trainer.save_every == 0:
+            if self.iteration % self.cfg.trainer.save_every == 0:
+                if self.using_expert_parallel:
+                    # EP shards experts across ranks, so every rank must save its shard.
                     self.save_state()
+                elif self.rank_zero_only:
+                    self.save_state()
+
+            if self.rank_zero_only:
                 run_eval = self.val_dataset is not None and not os.getenv("NO_VAL", "0") == "1"
                 if run_eval and self.iteration > 0 and self.iteration % self.cfg.trainer.val_every == 0:
                     val_metrics = self.validate()
@@ -673,7 +721,9 @@ class Trainer:
                     rank_zero=False,
                 )
             self.iteration += 1
-        if self.rank_zero_only:
+        if self.using_expert_parallel:
+            self.save_state()
+        elif self.rank_zero_only:
             self.save_state()
             if not os.getenv("NO_VAL", "0") == "1":
                 val_metrics = self.validate()

@@ -72,7 +72,7 @@ Not fully verified:
 - Prodigy optimizer
 
 ### Quick MoE try (B200-friendly)
-Set these in your YAML (e.g. `configs/smollm2_wide.yaml` under `model:`) to increase parameter count at ~same per-token compute:
+Set these in your YAML (e.g. `sample_efficient_gpt/configs/smollm2_wide.yaml` under `model:`) to increase parameter count at ~same per-token compute:
 ```yaml
 model:
   moe_num_experts: 8        # 0 disables MoE
@@ -81,6 +81,8 @@ model:
   moe_aux_loss_coef: 0.01   # load balancing
   moe_z_loss_coef: 0.0      # optional router z-loss
   moe_router_jitter: 0.0    # e.g. 0.01 for noisy routing
+  moe_expert_parallel_size: 1 # set == world_size to shard experts (top_k must be 1)
+  moe_expert_precision: bf16  # bf16 (default) or fp8 (experts only; requires torchao)
   moe_start_layer: 0
   moe_every_n_layers: 1     # apply MoE to every layer
   moe_end_layer: null

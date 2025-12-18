@@ -1,0 +1,121 @@
+base: gpt_small_faster
+
+data_mix: &data_mix
+  tokenizer_path: HuggingFaceTB/SmolLM2-135M
+  validation_path: /home/george/sample_efficient_gpt/sample_efficient_gpt/data_smollm2_imu/val.npy
+  train_path: 1215_data_mix.json
+  context_length: 512
+  batch_size: 8
+  val_batch_size: 4
+
+trainer_base: &trainer_base
+  dist_mode: ddp
+  save_dir: /mnt/harddrive/checkpoints
+  log_every: 1
+  val_every: 1000000000
+  save_every: 1000000000
+  run_name: "{date}_moe_smoke"
+  gradient_accumulation_steps: 1
+  max_steps: 200
+
+optim_base: &optim_base
+  scheduler: wsd
+  lr: 3e-4
+  warmup_steps: 50
+  wsd_need_warmup: true
+  wsd_phase: stable
+
+model_small_moe: &model_small_moe
+  vocab_size: 49152
+  d_model: 512
+  d_ff: 2048
+  n_layers: 12
+  n_heads: 8
+  n_kv_heads: 2
+  weight_tying: true
+  layernorm_scaling: true
+  attn_qknorm: true
+  attn_gating: false
+  attn_val_residual: false
+  moe_num_experts: 8
+  moe_top_k: 1
+  moe_capacity_factor: 1.25
+  moe_aux_loss_coef: 0.01
+  moe_z_loss_coef: 0.0
+  moe_router_jitter: 0.0
+  moe_normalize_gates: true
+  moe_start_layer: 2
+  moe_every_n_layers: 2
+  moe_end_layer: null
+  moe_expert_parallel_size: 1
+  moe_expert_precision: bf16
+
+experiments:
+  moe_smoke_1gpu:
+    model: *model_small_moe
+    trainer: *trainer_base
+    optim: *optim_base
+    data: *data_mix
+
+  moe_ep_smoke_2gpu:
+    model:
+      <<: *model_small_moe
+      moe_expert_parallel_size: 2
+    trainer:
+      <<: *trainer_base
+      run_name: "{date}_moe_ep_smoke"
+    optim: *optim_base
+    data:
+      <<: *data_mix
+      batch_size: 16
+
+  moe_ep_fp8_b200_8gpu:
+    model:
+      vocab_size: 49152
+      d_model: 1152
+      d_ff: 3072
+      n_layers: 30
+      n_heads: 18
+      n_kv_heads: 6
+      weight_tying: true
+      layernorm_scaling: true
+      attn_qknorm: true
+      attn_gating: per-head
+      attn_val_residual: true
+      moe_num_experts: 64
+      moe_top_k: 1
+      moe_capacity_factor: 1.25
+      moe_aux_loss_coef: 0.01
+      moe_z_loss_coef: 0.0
+      moe_router_jitter: 0.0
+      moe_normalize_gates: true
+      moe_start_layer: 0
+      moe_every_n_layers: 1
+      moe_end_layer: 30
+      moe_expert_parallel_size: 8
+      moe_expert_precision: fp8
+    trainer:
+      dist_mode: ddp
+      save_dir: /mnt/harddrive/checkpoints
+      run_name: "{date}_moe_ep_fp8_b200"
+      log_every: 10
+      val_every: 5000
+      save_every: 5000
+      gradient_accumulation_steps: 8
+      max_steps: 1000000
+    optim:
+      scheduler: wsd
+      muon_wd: 0.1
+      muon_lr: 1.1e-2
+      lr: 6e-3
+      warmup_steps: 20000
+      wsd_need_warmup: true
+      wsd_phase: stable
+    data:
+      tokenizer_path: HuggingFaceTB/SmolLM2-135M
+      validation_path: /home/george/sample_efficient_gpt/sample_efficient_gpt/data_smollm2_imu/val.npy
+      train_path: 1215_data_mix.json
+      context_length: 704
+      batch_size: 60
+      val_batch_size: 12
+

@@ -21,6 +21,8 @@ class DDP(nn.Module):
         prev_dt = None
 
         for n, p in list(self.module.named_parameters())[::-1]:
+            if getattr(p, "_expert_parallel", False):
+                continue
             dist.broadcast(p.data, src=0)
             if not (p.is_leaf and p.requires_grad):
                 continue
@@ -46,6 +48,8 @@ class DDP(nn.Module):
         }
 
         for n, p in self.module.named_parameters():
+            if getattr(p, "_expert_parallel", False):
+                continue
             if p.is_leaf and p.requires_grad:
                 bucket_idx = self.buckets_map[n]
                 param_name = n

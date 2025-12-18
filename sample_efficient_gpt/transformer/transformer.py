@@ -50,6 +50,8 @@ class Block(nn.Module):
         moe_z_loss_coef: float = 0.0,
         moe_router_jitter: float = 0.0,
         moe_normalize_gates: bool = True,
+        moe_expert_parallel_size: int = 1,
+        moe_expert_precision: str = "bf16",
         attn_qknorm: bool = False,
         attn_val_residual: bool = False,
         attn_gating: bool = False,
@@ -88,6 +90,8 @@ class Block(nn.Module):
                 z_loss_coef=moe_z_loss_coef,
                 router_jitter=moe_router_jitter,
                 normalize_gates=moe_normalize_gates,
+                expert_parallel_size=moe_expert_parallel_size,
+                expert_precision=moe_expert_precision,
                 device=device,
                 dtype=dtype,
             )
@@ -147,6 +151,8 @@ class Transformer(nn.Module):
         moe_z_loss_coef: float = 0.0,
         moe_router_jitter: float = 0.0,
         moe_normalize_gates: bool = True,
+        moe_expert_parallel_size: int = 1,
+        moe_expert_precision: str = "bf16",
         moe_start_layer: int = 0,
         moe_every_n_layers: int = 1,
         moe_end_layer: int | None = None,
@@ -163,6 +169,8 @@ class Transformer(nn.Module):
         self.moe_z_loss_coef = float(moe_z_loss_coef)
         self.moe_router_jitter = float(moe_router_jitter)
         self.moe_normalize_gates = bool(moe_normalize_gates)
+        self.moe_expert_parallel_size = int(moe_expert_parallel_size)
+        self.moe_expert_precision = str(moe_expert_precision)
         self.moe_start_layer = int(moe_start_layer)
         self.moe_every_n_layers = int(moe_every_n_layers)
         self.moe_end_layer = int(moe_end_layer) if moe_end_layer is not None else None
@@ -192,6 +200,8 @@ class Transformer(nn.Module):
                     moe_z_loss_coef=self.moe_z_loss_coef,
                     moe_router_jitter=self.moe_router_jitter,
                     moe_normalize_gates=self.moe_normalize_gates,
+                    moe_expert_parallel_size=self.moe_expert_parallel_size,
+                    moe_expert_precision=self.moe_expert_precision,
                     theta=theta,
                     attn_qknorm=attn_qknorm,
                     attn_val_residual=attn_val_residual,
@@ -222,11 +232,18 @@ class Transformer(nn.Module):
         v1 = None
         for i, layer in enumerate(self.blocks):
             with nvtx_range(f"block {i}"):
-                if i < self.num_grad_checkpoint_layers:
+                # EP MoE uses all-to-all collectives in forward; avoid activation checkpointing for those blocks
+                # (checkpoint would re-run collectives during backward, increasing overhead and risking hangs).
+                is_ep_moe = bool(
+                    getattr(layer, "_ffn_is_moe", False)
+                    and isinstance(getattr(layer, "ffn", None), TopKMoE)
+                    and getattr(layer.ffn, "_ep_enabled", False)
+                )
+                if i < self.num_grad_checkpoint_layers and not is_ep_moe:
                     # checkpoint this block
-                    def layer_forward(x, v1, kv_cache):
-                        # IMPORTANT: capture block via closure, pass extra args through
-                        return layer(x, v1=v1, kv_cache=kv_cache)
+                    def layer_forward(x, v1, kv_cache, _layer=layer):
+                        # IMPORTANT: bind `layer` as a default arg to avoid late-binding bugs during recomputation.
+                        return _layer(x, v1=v1, kv_cache=kv_cache)
 
                     # use_reentrant=False plays nicer with torch.compile
                     x, avg_kurtosis, v, moe_aux = checkpoint(
@@ -242,6 +259,20 @@ class Transformer(nn.Module):
             moe_aux_loss = moe_aux_loss + moe_aux
         x = self.final_norm(x)
         return self.lm_head(x), avg_kurtosis_values, moe_aux_loss
+
+    def maybe_convert_moe_experts_to_fp8(self) -> None:
+        """
+        Convert only MoE expert matmuls to float8 (best-effort).
+
+        Call after moving the model to CUDA and before initializing the optimizer / DDP buckets.
+        """
+        if self.moe_num_experts <= 0:
+            return
+        if self.moe_expert_precision.lower() != "fp8":
+            return
+        for m in self.modules():
+            if isinstance(m, TopKMoE):
+                m.convert_experts_to_fp8()
 
     def generate(
         self,

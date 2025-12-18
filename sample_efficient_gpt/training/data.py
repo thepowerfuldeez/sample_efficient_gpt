@@ -59,9 +59,9 @@ class MemoryMappedDataset:
             else:
                 arr = self._read_file(path_or_ds)
                 l = arr.shape[0]
-                lengths.append(total_length)
                 ds.append(arr)
                 total_length += l
+                lengths.append(total_length)
         self.total_length = total_length
         assert self.total_length > 0
         self.ds = ds

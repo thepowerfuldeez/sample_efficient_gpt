@@ -64,6 +64,10 @@ class ModelConfig:
     moe_z_loss_coef: float = 0.0
     moe_router_jitter: float = 0.0
     moe_normalize_gates: bool = True
+    # expert parallelism (currently supports moe_expert_parallel_size == world_size)
+    moe_expert_parallel_size: int = 1
+    # expert matmul precision mode (best-effort; may fall back depending on environment)
+    moe_expert_precision: str = "bf16"  # "bf16" or "fp8"
     # apply MoE to layers in [start, end) every N layers
     moe_start_layer: int = 0
     moe_every_n_layers: int = 1

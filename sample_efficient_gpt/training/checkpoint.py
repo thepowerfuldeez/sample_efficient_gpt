@@ -26,6 +26,9 @@ def save_checkpoint(
     optimizers: list[Optimizer],
     iteration: int = 0,
     run_id: str | None = None,
+    rank: int | None = None,
+    world_size: int | None = None,
+    shard_type: str | None = None,
 ):
     model_state_dict = model.state_dict()
     optimizers_state_dict = [optimizer.state_dict() for optimizer in optimizers]
@@ -37,6 +40,9 @@ def save_checkpoint(
             "optimizer": optimizers_state_dict,
             "iteration": iteration,
             "run_id": run_id,
+            "rank": rank,
+            "world_size": world_size,
+            "shard_type": shard_type,
         },
         fpath,
     )
@@ -45,6 +51,55 @@ def save_checkpoint(
 def load_model(fpath: Path, cfg: Config, model: nn.Module) -> int:
     checkpoint = torch.load(fpath, map_location="cpu", weights_only=False)
     model.load_state_dict(checkpoint["model"])
+    return checkpoint["iteration"], checkpoint.get("run_id")
+
+
+def load_model_expert_parallel(
+    fpath: Path, cfg: Config, model: nn.Module, *, rank: int, world_size: int
+) -> tuple[int, str | None]:
+    """
+    Load a checkpoint into an expert-parallel MoE model.
+
+    Supports:
+    - Loading a per-rank sharded checkpoint saved with shard_type='expert_parallel'
+    - Loading a full (non-sharded) checkpoint and slicing experts by rank:
+        global_expert = rank * num_local_experts + local_expert
+    """
+    checkpoint = torch.load(fpath, map_location="cpu", weights_only=False)
+    src_sd: dict[str, torch.Tensor] = checkpoint["model"]
+    shard_type = checkpoint.get("shard_type")
+
+    if shard_type == "expert_parallel":
+        model.load_state_dict(src_sd)
+        return checkpoint["iteration"], checkpoint.get("run_id")
+
+    num_experts = int(cfg.model.moe_num_experts)
+    if num_experts <= 0:
+        raise ValueError("load_model_expert_parallel requires cfg.model.moe_num_experts > 0")
+    if num_experts % world_size != 0:
+        raise ValueError(f"moe_num_experts ({num_experts}) must be divisible by world_size ({world_size})")
+    num_local = num_experts // world_size
+
+    dst_sd = model.state_dict()
+    remapped: dict[str, torch.Tensor] = {}
+    for k, v in dst_sd.items():
+        parts = k.split(".")
+        # blocks.{layer}.ffn.experts.{local}.*
+        if len(parts) >= 6 and parts[0] == "blocks" and parts[2] == "ffn" and parts[3] == "experts" and parts[4].isdigit():
+            local = int(parts[4])
+            if not (0 <= local < num_local):
+                raise ValueError(f"Local expert index out of range for rank shard: {k}")
+            global_expert = rank * num_local + local
+            src_k = ".".join(parts[:4] + [str(global_expert)] + parts[5:])
+            if src_k not in src_sd:
+                raise KeyError(f"Checkpoint missing expected global expert key: {src_k}")
+            remapped[k] = src_sd[src_k]
+        else:
+            if k not in src_sd:
+                raise KeyError(f"Checkpoint missing expected key: {k}")
+            remapped[k] = src_sd[k]
+
+    model.load_state_dict(remapped)
     return checkpoint["iteration"], checkpoint.get("run_id")
 
 

@@ -234,6 +234,30 @@ def _build_swiglu_up_weight(
     return out
 
 
+def _permute_swiglu_hidden(
+    up_weight: torch.Tensor, down_weight: torch.Tensor, perm: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Permute the SwiGLU hidden dimension in a function-preserving way.
+
+    - `up_weight` is (2*d_ff, d_model) with [gate; up] stacked.
+    - `down_weight` is (d_model, d_ff).
+    - `perm` is a permutation of range(d_ff).
+    """
+    d_ff = int(down_weight.shape[1])
+    if up_weight.shape[0] != 2 * d_ff:
+        raise ValueError(f"Unexpected SwiGLU up_weight shape: {tuple(up_weight.shape)} vs (2*{d_ff}, d_model)")
+    if perm.numel() != d_ff:
+        raise ValueError(f"perm length mismatch: {perm.numel()} vs d_ff={d_ff}")
+
+    up_out = up_weight.detach().clone()
+    up_out[0:d_ff] = up_weight[0:d_ff][perm]
+    up_out[d_ff : 2 * d_ff] = up_weight[d_ff : 2 * d_ff][perm]
+
+    down_out = down_weight[:, perm].detach().clone()
+    return up_out, down_out
+
+
 def _patch_cpu_safety() -> None:
     """
     Avoid unconditional CUDA side-effects at import time from some Triton modules.
@@ -264,6 +288,18 @@ def _convert(
     layernorm_scaling: bool,
     weight_tying: bool,
     qknorm_gain: float | None,
+    moe_num_experts: int,
+    moe_top_k: int,
+    moe_capacity_factor: float,
+    moe_aux_loss_coef: float,
+    moe_z_loss_coef: float,
+    moe_router_jitter: float,
+    moe_normalize_gates: bool,
+    moe_start_layer: int,
+    moe_every_n_layers: int,
+    moe_end_layer: int | None,
+    moe_expert_init: Literal["copy", "permute"],
+    moe_permute_seed: int,
 ) -> None:
     hf_cfg = AutoConfig.from_pretrained(hf_dir)
     hf_model = AutoModelForCausalLM.from_pretrained(hf_dir, dtype=torch.float32, device_map={"": "cpu"})
@@ -320,6 +356,18 @@ def _convert(
         device="cpu",
         dtype=torch.float32,
         weight_tying=weight_tying,
+        moe_num_experts=moe_num_experts,
+        moe_top_k=moe_top_k,
+        moe_capacity_factor=moe_capacity_factor,
+        moe_aux_loss_coef=moe_aux_loss_coef,
+        moe_z_loss_coef=moe_z_loss_coef,
+        moe_router_jitter=moe_router_jitter,
+        moe_normalize_gates=moe_normalize_gates,
+        moe_expert_parallel_size=1,
+        moe_expert_precision="bf16",
+        moe_start_layer=moe_start_layer,
+        moe_every_n_layers=moe_every_n_layers,
+        moe_end_layer=moe_end_layer,
         num_grad_checkpoint_layers=0,
     )
     target.eval()
@@ -438,31 +486,85 @@ def _convert(
 
         gate_w = hf_sd[f"{hf_prefix}.mlp.gate_proj.weight"]
         up_w = hf_sd[f"{hf_prefix}.mlp.up_proj.weight"]
-        src_dff = gate_w.shape[0]
-        out_sd[f"{imu_prefix}.ffn.up.linear.weight"] = _build_swiglu_up_weight(
-            gate=gate_w,
-            up=up_w,
-            src_hidden=src_hidden,
-            dst_hidden=width,
-            src_dff=src_dff,
-            dst_dff=d_ff,
-            init_up=out_sd[f"{imu_prefix}.ffn.up.linear.weight"],
-            init_multiplier=init_multiplier,
-            mode=widening_mode,
-        )
+        src_dff = int(gate_w.shape[0])
 
-        if widening_mode == "preserve":
-            down_w = _init_tensor_like(
-                out_sd[f"{imu_prefix}.ffn.down.linear.weight"], init_multiplier=init_multiplier, mode=widening_mode
+        is_moe_layer = f"{imu_prefix}.ffn.router.weight" in out_sd
+        if is_moe_layer:
+            if moe_num_experts <= 0:
+                raise ValueError("Target model has MoE layers but moe_num_experts <= 0.")
+
+            # Initialize router to zeros: softmax is uniform, and argmax ties route to expert 0.
+            out_sd[f"{imu_prefix}.ffn.router.weight"] = torch.zeros_like(out_sd[f"{imu_prefix}.ffn.router.weight"])
+            out_sd[f"{imu_prefix}.ffn.router.bias"] = torch.zeros_like(out_sd[f"{imu_prefix}.ffn.router.bias"])
+
+            up0_key = f"{imu_prefix}.ffn.experts.0.ffn.up.linear.weight"
+            down0_key = f"{imu_prefix}.ffn.experts.0.ffn.down.linear.weight"
+            dst_dff = int(out_sd[up0_key].shape[0] // 2)
+
+            base_up = _build_swiglu_up_weight(
+                gate=gate_w,
+                up=up_w,
+                src_hidden=src_hidden,
+                dst_hidden=width,
+                src_dff=src_dff,
+                dst_dff=dst_dff,
+                init_up=out_sd[up0_key],
+                init_multiplier=init_multiplier,
+                mode=widening_mode,
             )
-            _copy_overlap_2d(down_w, hf_sd[f"{hf_prefix}.mlp.down_proj.weight"])
-            out_sd[f"{imu_prefix}.ffn.down.linear.weight"] = down_w
+            if widening_mode == "preserve":
+                base_down = _init_tensor_like(out_sd[down0_key], init_multiplier=init_multiplier, mode=widening_mode)
+                _copy_overlap_2d(base_down, hf_sd[f"{hf_prefix}.mlp.down_proj.weight"])
+            else:
+                base_down = _scale_and_copy_like(
+                    out_sd[down0_key],
+                    hf_sd[f"{hf_prefix}.mlp.down_proj.weight"],
+                    init_multiplier,
+                )
+
+            out_sd[up0_key] = base_up
+            out_sd[down0_key] = base_down
+
+            g = torch.Generator(device="cpu")
+            g.manual_seed(int(moe_permute_seed) + 10_000 * layer_idx)
+            for expert_id in range(1, int(moe_num_experts)):
+                up_key = f"{imu_prefix}.ffn.experts.{expert_id}.ffn.up.linear.weight"
+                down_key = f"{imu_prefix}.ffn.experts.{expert_id}.ffn.down.linear.weight"
+
+                if moe_expert_init == "copy":
+                    out_sd[up_key] = base_up.detach().clone()
+                    out_sd[down_key] = base_down.detach().clone()
+                else:
+                    perm = torch.randperm(dst_dff, generator=g)
+                    up_p, down_p = _permute_swiglu_hidden(base_up, base_down, perm)
+                    out_sd[up_key] = up_p
+                    out_sd[down_key] = down_p
         else:
-            out_sd[f"{imu_prefix}.ffn.down.linear.weight"] = _scale_and_copy_like(
-                out_sd[f"{imu_prefix}.ffn.down.linear.weight"],
-                hf_sd[f"{hf_prefix}.mlp.down_proj.weight"],
-                init_multiplier,
+            ffn_up_key = f"{imu_prefix}.ffn.up.linear.weight"
+            ffn_down_key = f"{imu_prefix}.ffn.down.linear.weight"
+            dst_dff = int(out_sd[ffn_up_key].shape[0] // 2)
+            out_sd[ffn_up_key] = _build_swiglu_up_weight(
+                gate=gate_w,
+                up=up_w,
+                src_hidden=src_hidden,
+                dst_hidden=width,
+                src_dff=src_dff,
+                dst_dff=dst_dff,
+                init_up=out_sd[ffn_up_key],
+                init_multiplier=init_multiplier,
+                mode=widening_mode,
             )
+
+            if widening_mode == "preserve":
+                down_w = _init_tensor_like(out_sd[ffn_down_key], init_multiplier=init_multiplier, mode=widening_mode)
+                _copy_overlap_2d(down_w, hf_sd[f"{hf_prefix}.mlp.down_proj.weight"])
+                out_sd[ffn_down_key] = down_w
+            else:
+                out_sd[ffn_down_key] = _scale_and_copy_like(
+                    out_sd[ffn_down_key],
+                    hf_sd[f"{hf_prefix}.mlp.down_proj.weight"],
+                    init_multiplier,
+                )
 
         # If gating is enabled, ensure the initial behavior is a no-op.
         # In attention.py we use `2*sigmoid(attn_gate(x))`, so zero weights => gate==1.
@@ -498,6 +600,18 @@ def _convert(
             "attn_val_residual": attn_val_residual,
             "attn_gating": attn_gating,
             "layernorm_scaling": layernorm_scaling,
+            "moe_num_experts": int(moe_num_experts),
+            "moe_top_k": int(moe_top_k),
+            "moe_capacity_factor": float(moe_capacity_factor),
+            "moe_aux_loss_coef": float(moe_aux_loss_coef),
+            "moe_z_loss_coef": float(moe_z_loss_coef),
+            "moe_router_jitter": float(moe_router_jitter),
+            "moe_normalize_gates": bool(moe_normalize_gates),
+            "moe_expert_parallel_size": 1,
+            "moe_expert_precision": "bf16",
+            "moe_start_layer": int(moe_start_layer),
+            "moe_every_n_layers": int(moe_every_n_layers),
+            "moe_end_layer": int(moe_end_layer) if moe_end_layer is not None else None,
         }
     )
 
@@ -608,6 +722,31 @@ def main() -> None:
         help="Tie word embeddings (defaults to template value if present, else HF tie_word_embeddings).",
     )
 
+    # Optional MoE upcycling (dense MLP -> MoE experts).
+    p.add_argument("--moe-num-experts", type=int, default=0, help="If >0, replace selected FFN layers with MoE.")
+    p.add_argument("--moe-top-k", type=int, default=1, help="MoE top-k routing (training code supports top_k>1 only without EP).")
+    p.add_argument("--moe-capacity-factor", type=float, default=1.0, help="MoE capacity factor (tokens per expert multiplier).")
+    p.add_argument("--moe-aux-loss-coef", type=float, default=0.01, help="Switch-style load balancing loss coefficient.")
+    p.add_argument("--moe-z-loss-coef", type=float, default=0.0, help="Router z-loss coefficient.")
+    p.add_argument("--moe-router-jitter", type=float, default=0.0, help="Router logits jitter stddev.")
+    p.add_argument(
+        "--moe-normalize-gates",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Normalize top-k gates to sum to 1 per token (only relevant for top_k>1).",
+    )
+    p.add_argument("--moe-start-layer", type=int, default=0, help="First layer index (0-based) to apply MoE.")
+    p.add_argument("--moe-every-n-layers", type=int, default=1, help="Apply MoE to every Nth layer starting from moe-start-layer.")
+    p.add_argument("--moe-end-layer", type=int, default=None, help="End layer index (0-based, exclusive) to stop applying MoE.")
+    p.add_argument(
+        "--moe-expert-init",
+        type=str,
+        default="permute",
+        choices=["copy", "permute"],
+        help="How to initialize experts from the dense MLP: exact copies or function-preserving permutations.",
+    )
+    p.add_argument("--moe-permute-seed", type=int, default=0, help="Seed for expert permutations (if moe-expert-init=permute).")
+
     args = p.parse_args()
 
     hf_cfg = AutoConfig.from_pretrained(args.hf_dir)
@@ -684,6 +823,18 @@ def main() -> None:
         layernorm_scaling=layernorm_scaling,
         weight_tying=weight_tying,
         qknorm_gain=args.qknorm_gain,
+        moe_num_experts=args.moe_num_experts,
+        moe_top_k=args.moe_top_k,
+        moe_capacity_factor=args.moe_capacity_factor,
+        moe_aux_loss_coef=args.moe_aux_loss_coef,
+        moe_z_loss_coef=args.moe_z_loss_coef,
+        moe_router_jitter=args.moe_router_jitter,
+        moe_normalize_gates=bool(args.moe_normalize_gates),
+        moe_start_layer=args.moe_start_layer,
+        moe_every_n_layers=args.moe_every_n_layers,
+        moe_end_layer=args.moe_end_layer,
+        moe_expert_init=args.moe_expert_init,
+        moe_permute_seed=args.moe_permute_seed,
     )
 
 
