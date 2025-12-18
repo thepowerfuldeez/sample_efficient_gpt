@@ -14,7 +14,7 @@ def parse_args():
     parser.add_argument("--data-file", required=True, help="JSONL file containing an 'embedding' column.")
     parser.add_argument("--start", type=int, default=0, help="Start index of slice to process.")
     parser.add_argument("--end", type=int, default=None, help="End index (exclusive) of slice to process.")
-    parser.add_argument("--select-frac", type=float, default=0.5, help="Fraction of examples to keep.")
+    parser.add_argument("--select-frac", type=float, default=0.8, help="Fraction of examples to keep.")
     parser.add_argument("--output-file", type=Path, required=True, help="Where to write the selected subset.")
     parser.add_argument("--embedding-dim", type=int, default=1024, help="Embedding dimension.")
     parser.add_argument("--batch-size", type=int, default=1024, help="Rows to load per chunk into the matrix.")

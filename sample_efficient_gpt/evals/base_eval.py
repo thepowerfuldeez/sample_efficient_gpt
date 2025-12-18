@@ -33,7 +33,9 @@ def print0(*args, **kwargs):
         print(*args, **kwargs)
 
 
-def evaluate_model(base_dir: Path, model, tokenizer, device, max_per_task=-1, batch_size: int = 8):
+def evaluate_model(
+    base_dir: Path, model, tokenizer, device, max_per_task=-1, batch_size: int = 8, task: str | None = None
+):
     """
     Evaluate a base model on the CORE benchmark.
     - max_per_task: crop the data to this many examples per task for testing (-1 = disable)
@@ -46,6 +48,11 @@ def evaluate_model(base_dir: Path, model, tokenizer, device, max_per_task=-1, ba
     eval_meta_data = eval_bundle_dir / "eval_meta_data.csv"
     config = yaml.safe_load(config_path.read_text())
     tasks = config["icl_tasks"]
+    if task:
+        tasks = [t for t in tasks if t.get("label") == task]
+        if not tasks:
+            available = sorted({t.get("label") for t in config["icl_tasks"]})
+            raise ValueError(f"Unknown task '{task}'. Available: {available}")
     eval_metadata = pd.read_csv(eval_meta_data)
 
     # Evaluate each task
@@ -102,15 +109,24 @@ def parse_args():
     p.add_argument("--base_dir", default=Path("/home/george/.cache/sample_efficient_gpt"), type=Path)
     p.add_argument("--results_dir", default=Path("/home/george/sample_efficient_gpt/evals/results"), type=Path)
     p.add_argument("--type", default="se", help="se or hf")
+    p.add_argument("--task", default="", help="specific task, like arc_easy")
+    p.add_argument("--max_per_task", type=int, default=-1, help="Max examples per task (-1 = full).")
+    p.add_argument(
+        "--tokenizer_path",
+        type=str,
+        default="thepowerfuldeez/imu_1_base",
+        help="custom tokenizer path if loading from se checkpoint",
+    )
     p.add_argument("--batch", type=int, default=8, help="per-rank eval batch size")
     return p.parse_args()
 
 
-def get_model(checkpoint, device):
+def get_model(checkpoint, device, tokenizer_path: str = "thepowerfuldeez/imu_1_base"):
     trainer = Trainer(
         load_from=checkpoint,
         load_components="infer",
-        **{"trainer.device": device, "data.tokenizer_path": "thepowerfuldeez/imu_1_base"},
+        compile=False,
+        **{"trainer.device": device, "data.tokenizer_path": tokenizer_path},
     )
     run_id = trainer.run_id
     project = trainer.cfg.project
@@ -143,13 +159,17 @@ def main():
 
     rank = dist.get_rank()
     device = f"cuda:{rank}"
+    torch.cuda.set_device(rank)
     args = parse_args()
 
     if args.type == "hf":
         model, tokenizer, run_id, project, iteration = get_model_hf(args.checkpoint, device)
         model_slug = args.checkpoint.replace("/", "_").lower()
     else:
-        model, tokenizer, run_id, project, iteration = get_model(args.checkpoint, device)
+        if args.tokenizer_path:
+            model, tokenizer, run_id, project, iteration = get_model(args.checkpoint, device, tokenizer_path=args.tokenizer_path)
+        else:
+            model, tokenizer, run_id, project, iteration = get_model(args.checkpoint, device)
         model_slug = f"base_model_{iteration:06d}"  # for the output csv file
     autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
     base_dir = args.base_dir
@@ -157,7 +177,15 @@ def main():
 
     # Evaluate the model
     with autocast_ctx:
-        out = evaluate_model(base_dir, model, tokenizer, device, batch_size=args.batch)
+        out = evaluate_model(
+            base_dir,
+            model,
+            tokenizer,
+            device,
+            max_per_task=args.max_per_task,
+            batch_size=args.batch,
+            task=args.task or None,
+        )
 
     # Write out the results to a csv file
     core_metric = None

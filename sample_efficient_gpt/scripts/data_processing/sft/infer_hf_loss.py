@@ -148,7 +148,7 @@ def infer(args):
 def main():
     args = parse_args()
     if args.task == "infer":
-        infer()
+        infer(args)
     else:
         filter_dataset_by_loss(args.input_path, args.output_path, args.keep_pct)
     

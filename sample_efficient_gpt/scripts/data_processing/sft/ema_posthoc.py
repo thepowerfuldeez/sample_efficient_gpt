@@ -18,7 +18,9 @@ def parse_args():
 
 # EMA decay: ema = decay * ema + (1 - decay) * param
 EMA_DECAY = 0.9  # pretty low value, 0.9 corresponds to 50k steps window with 23 checkpoints
-EMA_SUFFIX = "_ema"
+EMA_SUFFIX = "_ema"  # pretty low value, 0.9 corresponds to 50k steps window with 23 checkpoints
+# EMA_DECAY = 0.95  # pretty low value, 0.9 corresponds to 50k steps window with 23 checkpoints
+# EMA_SUFFIX = "_ema95"
 
 
 def list_normal_checkpoints(dirs):
@@ -35,7 +37,11 @@ def list_normal_checkpoints(dirs):
                 # skip EMA files
                 continue
             # iteration number is the name of the file
-            it = int(Path(base).stem)
+            try:
+                it = int(Path(base).stem)
+            except:
+                # skip ema files
+                continue
 
             ckpts.append((it, path))
 

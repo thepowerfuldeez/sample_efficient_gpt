@@ -1,3 +1,4 @@
+import math
 import os
 import time
 from pathlib import Path
@@ -31,8 +32,9 @@ from sample_efficient_gpt.training import (
 from sample_efficient_gpt.config_schema import Config
 from sample_efficient_gpt.utils.logger import logger
 from sample_efficient_gpt.utils.config_tools import load_config, apply_overrides
+from sample_efficient_gpt.training.sft_dataset import SFTDataset
 
-from sample_efficient_gpt.training.distributed import DDP, ShardedOptimizer
+from sample_efficient_gpt.training.distributed import DDP
 
 from sample_efficient_gpt.evals.mbpp_eval import SimpleMBPPEvaluator
 
@@ -71,6 +73,7 @@ class Trainer:
         for i in range(self.world_size):
             if "RTX 5090" in torch.cuda.get_device_name(i):
                 self.target_log_rank = i
+                print(f"discovered {self.target_log_rank=}")
                 break
 
         seed = 42 + self.rank
@@ -87,6 +90,7 @@ class Trainer:
         else:
             logger.info("Loading from config")
             self.cfg = cfg
+        self.using_sft = self.cfg.data.mode == "sft"
         self.iteration = 0
         self.wandb = wandb
 
@@ -96,11 +100,13 @@ class Trainer:
             self.cfg.model.d_model,
             self.cfg.model.n_heads,
             self.cfg.model.d_ff,
+            n_kv_heads=self.cfg.model.n_kv_heads,
             attn_qknorm=self.cfg.model.attn_qknorm,
             attn_val_residual=self.cfg.model.attn_val_residual,
             attn_gating=self.cfg.model.attn_gating,
             layernorm_scaling=self.cfg.model.layernorm_scaling,
             theta=self.cfg.model.theta,
+            rope_interleaved=self.cfg.model.rope_interleaved,
             device="cpu",
             # always keep master weights in fp32
             dtype=torch.float32,
@@ -116,21 +122,8 @@ class Trainer:
         if self.is_distributed:
             if self.cfg.trainer.dist_mode == "ddp":
                 self.model = DDP(self.model)
-            elif self.cfg.trainer.dist_mode == "fsdp":
-                # FSDP setup - modern approach with mixed precision
-                from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy, FSDPModule
-
-                fsdp_kwargs = {
-                    "mp_policy": MixedPrecisionPolicy(
-                        param_dtype=torch.bfloat16,
-                        reduce_dtype=torch.float32,
-                    )
-                }
-                for layer in self.model.blocks:
-                    fully_shard(layer, **fsdp_kwargs)
-                fully_shard(self.model, **fsdp_kwargs)
-
-                assert isinstance(self.model, FSDPModule)
+            else:
+                raise ValueError(f"Unsupported dist_mode={self.cfg.trainer.dist_mode!r}; expected 'ddp'.")
             # 749.5TFLOPS of compute in bf16 when using 4 gpus
             if self.world_size == 4:
                 self.available_flops = 749.5e12 * flops_multiplier
@@ -174,20 +167,46 @@ class Trainer:
                 self.load_state(load_from, model_only=False, optimizers_only=True)
 
             logger.info(f"Model is created with hparams {self.cfg.model}")
-            self.train_dataset = MemoryMappedDataset(
-                self.cfg.data.train_path,
-                self.cfg.data.context_length,
-                torch.device(self.cfg.trainer.device),
-                self.cfg.data.seed + self.rank,
-                world_size=self.world_size,
-                rank=self.rank,
-            )
-            self.val_dataset = MemoryMappedDataset(
-                self.cfg.data.validation_path,
-                self.cfg.data.context_length,
-                torch.device(self.cfg.trainer.device),
-                self.cfg.data.seed + self.rank,
-            )
+            if self.using_sft:
+                self.train_dataset = SFTDataset(
+                    self.cfg.data.train_path,
+                    self.cfg.data.context_length,
+                    pad_token_id=self.tokenizer.encode("<|pad|>")[0],
+                    label_pad_token_id=-100,
+                    sample_packing=self.cfg.data.sample_packing,
+                    seed=self.cfg.data.seed + self.rank,
+                    world_size=self.world_size,
+                    rank=self.rank,
+                )
+                self.val_dataset = (
+                    SFTDataset(
+                        self.cfg.data.validation_path,
+                        self.cfg.data.context_length,
+                        pad_token_id=self.tokenizer.encode("<|pad|>")[0],
+                        label_pad_token_id=-100,
+                        sample_packing=False,
+                        seed=self.cfg.data.seed + self.rank,
+                        world_size=self.world_size,
+                        rank=self.rank,
+                    )
+                    if self.cfg.data.validation_path
+                    else None
+                )
+            else:
+                self.train_dataset = MemoryMappedDataset(
+                    self.cfg.data.train_path,
+                    self.cfg.data.context_length,
+                    torch.device(self.cfg.trainer.device),
+                    self.cfg.data.seed + self.rank,
+                    world_size=self.world_size,
+                    rank=self.rank,
+                )
+                self.val_dataset = MemoryMappedDataset(
+                    self.cfg.data.validation_path,
+                    self.cfg.data.context_length,
+                    torch.device(self.cfg.trainer.device),
+                    self.cfg.data.seed + self.rank,
+                )
             self.save_dir = Path(self.cfg.trainer.save_dir)
             self.save_dir.mkdir(exist_ok=True, parents=True)
         else:
@@ -356,11 +375,13 @@ class Trainer:
         val_iters = 0
         val_loss_epoch = torch.zeros((), device=self.current_device, dtype=torch.float32)
         val_loss_bpb_epoch = torch.zeros((), device=self.current_device, dtype=torch.float32)
-        for inputs, targets in tqdm(
-            self.val_dataset.get_iterator(self.cfg.data.val_batch_size),
-            total=len(self.val_dataset) // (self.cfg.data.val_batch_size * (self.cfg.data.context_length + 1)),
-            desc="Running validation",
-        ):
+        iterator = self.val_dataset.get_iterator(self.cfg.data.val_batch_size)
+        total_iters = (
+            math.ceil(len(self.val_dataset) / self.cfg.data.val_batch_size / self.world_size)
+            if self.using_sft
+            else len(self.val_dataset) // (self.cfg.data.val_batch_size * (self.cfg.data.context_length + 1))
+        )
+        for inputs, targets in tqdm(iterator, total=max(1, total_iters), desc="Running validation"):
             inputs = inputs.to(self.cfg.trainer.device)
             targets = targets.to(self.cfg.trainer.device)
             with (
@@ -408,6 +429,7 @@ class Trainer:
                 self.iteration,
                 lr,
                 lr_min,
+                self.cfg.optim.zero_lr_steps,
                 self.cfg.optim.warmup_steps,
                 self.decay_steps,
                 self.start_decay_step,
@@ -458,6 +480,8 @@ class Trainer:
         iter_lr, iter_wd = self._set_lr()
 
         z_loss_weight = self.cfg.trainer.z_loss_weight
+        ga_steps = max(1, int(self.cfg.trainer.gradient_accumulation_steps))
+        is_accum_boundary = ((self.iteration + 1) % ga_steps) == 0
 
         # start = torch.cuda.Event(enable_timing=True)
         # end = torch.cuda.Event(enable_timing=True)
@@ -476,24 +500,18 @@ class Trainer:
 
         coef = 1.0
         # we would divide loss for backward so that at all-reduce we get scaled grads
-        if self.cfg.trainer.gradient_accumulation_steps > 1:
-            coef /= self.cfg.trainer.gradient_accumulation_steps
+        if ga_steps > 1:
+            coef /= ga_steps
 
         # Compute proper coefficient based on grad accum / DDP
         if self.is_distributed:
             coef *= self.train_dataset.local_batch_size / self.cfg.data.batch_size
 
         # fused loss implementation already includes z_loss with coef
-        loss_for_backward = loss * coef
+        loss_for_backward = (loss + z_loss_weight * z_loss) * coef
 
-        if self.is_distributed:
-            if hasattr(self.model, "no_sync"):
-                context = self.model.no_sync()
-            elif (
-                self.cfg.trainer.dist_mode == "fsdp"
-                and self.iteration % self.cfg.trainer.gradient_accumulation_steps != 0
-            ):
-                self.model.set_requires_gradient_sync(False)
+        if self.is_distributed and hasattr(self.model, "no_sync") and not is_accum_boundary:
+            context = self.model.no_sync()
         else:
             context = nullcontext()
 
@@ -505,14 +523,11 @@ class Trainer:
         # end.synchronize()
 
         time_comm = 0.0
-        if self.iteration % self.cfg.trainer.gradient_accumulation_steps == 0:
+        if is_accum_boundary:
             update_ratios = []
             # DDP
             if self.is_distributed and hasattr(self.model, "finish_gradient_synchronization"):
                 time_comm = self.model.finish_gradient_synchronization()
-            # FSDP
-            if self.cfg.trainer.dist_mode == "fsdp":
-                self.model.set_requires_gradient_sync(True)
 
             grad_norm = clip_grad_norm_(self.model.parameters(), self.cfg.trainer.max_grad_norm)
             for opt in self.optimizers:
@@ -524,11 +539,15 @@ class Trainer:
             grad_norm = torch.tensor(0.0)
             update_ratios = [torch.tensor(0.0) for _ in range(len(self.optimizers))]
 
-        parameter_norms = {
-            k: p.data.detach().norm()
-            for k, p in getattr(self.model, "module", self.model).named_parameters()
-            if "attn" in k or "ffn" in k
-        }
+        need_rank0_log = self.rank_zero_only and (self.iteration % self.cfg.trainer.log_every == 0)
+        if need_rank0_log:
+            parameter_norms = {
+                k: p.data.detach().norm()
+                for k, p in getattr(self.model, "module", self.model).named_parameters()
+                if "attn" in k or "ffn" in k
+            }
+        else:
+            parameter_norms = {}
         # scale reported loss if it's superbpe
         train_loss = loss.detach() * self.train_loss_multiplier
         z_loss = z_loss.detach() * self.train_loss_multiplier
@@ -567,7 +586,9 @@ class Trainer:
             "parameter_norms": {k: v.item() for k, v in step_stats["parameter_norms"].items()},
             "mfu": mfu,
         }
-        if self.is_distributed and self.iteration % self.cfg.trainer.gradient_accumulation_steps == 0:
+        ga_steps = max(1, int(self.cfg.trainer.gradient_accumulation_steps))
+        is_accum_boundary = ((self.iteration + 1) % ga_steps) == 0
+        if self.is_distributed and is_accum_boundary:
             for k in ["opt_0_update_ratio", "opt_1_update_ratio"]:
                 update_ratios = torch.zeros(self.world_size, device=step_stats[k].device, dtype=step_stats[k].dtype)
                 dist.all_gather_into_tensor(update_ratios, step_stats[k])
@@ -598,9 +619,10 @@ class Trainer:
             end = time.monotonic()
 
             raw_step_stats["step_time"] = end - start
-            step_stats = self.postprocess_step_stats(raw_step_stats)
+            need_rank0_log = self.rank_zero_only and (self.iteration % self.cfg.trainer.log_every == 0)
+            step_stats = self.postprocess_step_stats(raw_step_stats) if need_rank0_log else None
 
-            if self.iteration % self.cfg.trainer.log_every == 0 and self.rank_zero_only:
+            if need_rank0_log:
                 logger.info(f"Train iteration {self.iteration}")
                 # call item and introduce sync
                 kurtosis_log = {f"log/block{i}_kurtosis": v for i, v in enumerate(step_stats["avg_kurtosis"])}
@@ -612,9 +634,17 @@ class Trainer:
                         "train/z_loss": step_stats["z_loss"],
                         "train/grad_norm": step_stats["grad_norm"],
                         "train/learning_rate": step_stats["learning_rate"],
-                        "train/wd": step_stats["wd"],
-                        "train/opt_0_update_ratio": step_stats["opt_0_update_ratio"],
-                        "train/opt_1_update_ratio": step_stats["opt_1_update_ratio"],
+                        **({"train/wd": step_stats["wd"]} if "wd" in step_stats else {}),
+                        **(
+                            {"train/opt_0_update_ratio": step_stats["opt_0_update_ratio"]}
+                            if "opt_0_update_ratio" in step_stats
+                            else {}
+                        ),
+                        **(
+                            {"train/opt_1_update_ratio": step_stats["opt_1_update_ratio"]}
+                            if "opt_1_update_ratio" in step_stats
+                            else {}
+                        ),
                         "train/step": self.iteration,
                         "train/step_time": step_stats["step_time"],
                         "train/step_comm_time": step_stats["time_comm"],

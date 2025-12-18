@@ -41,7 +41,7 @@ def main():
         default="Skywork/Skywork-Reward-V2-Qwen3-0.6B",
         help="Reward model checkpoint",
     )
-    parser.add_argument("--batch-size", type=int, default=32, help="Rows to score per forward pass.")
+    parser.add_argument("--batch-size", type=int, default=8, help="Rows to score per forward pass.")
     parser.add_argument("--max-length", type=int, default=1024, help="Max tokens per example.")
     parser.add_argument("--world-size", type=int, default=None, help="Override world size (else torchrun env).")
     parser.add_argument("--rank", type=int, default=None, help="Override rank (else LOCAL_RANK/WORLD_SIZE).")
@@ -50,6 +50,12 @@ def main():
         type=str,
         default="k_rewards",
         help="Prefix for rank-suffixed JSONL outputs.",
+    )
+    parser.add_argument(
+        "--start_idx", type=int, default=-1, help="Number of rows to generate (uses ds.select(range(limit)))."
+    )
+    parser.add_argument(
+        "--end_idx", type=int, default=-1, help="Number of rows to generate (uses ds.select(range(limit)))."
     )
     parser.add_argument("--output-dir", type=Path, default=Path("."), help="Directory for outputs.")
     args = parser.parse_args()
@@ -63,6 +69,14 @@ def main():
 
     model, tokenizer = get_model(device, args.model_checkpoint)
     ds = load_dataset("json", data_files=args.data_file)["train"]
+
+    if args.start_idx != -1 and args.end_idx != -1:
+        if args.end_idx == -1:
+            end = len(ds)
+        else:
+            end = args.end_idx
+        ds = ds.select(range(args.start_idx, end))
+
     total = len(ds)
     per_rank = (total + world_size - 1) // world_size
     start = rank * per_rank

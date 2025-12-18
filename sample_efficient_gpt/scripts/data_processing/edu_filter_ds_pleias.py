@@ -17,13 +17,15 @@ from sample_efficient_gpt.tokenizer.pretokenization import find_chunk_boundaries
 disable_caching()
 
 
-def apply_classifier_language_batch(docs, batch_size=128):
+def apply_classifier_language_batch(model, docs, batch_size=128):
     print(f"received {len(docs)} docs")
     results = []
     with torch.autocast("cuda", torch.bfloat16), torch.inference_mode():
         for i in tqdm(list(range(0, len(docs), batch_size)), desc="Batches"):
             texts_batch = docs[i : i + batch_size]
             inputs = tokenizer(texts_batch, return_tensors="pt", padding="longest", truncation=True)
+            # for k, v in inputs.items():
+            #     torch._dynamo.mark_dynamic(v, 1)
             outputs = model(**inputs)
             logits = outputs.logits.squeeze(-1).float().detach().cpu().numpy()
             scores = [logit.item() for logit in logits]
@@ -60,6 +62,14 @@ def read_parquet(chunk_path):
     return ds.shuffle(seed=42)
 
 
+def read_parquet_next(chunk_path):
+    ds = load_dataset("parquet", data_files=str(chunk_path), split="train")
+    ds_memo = ds.filter(lambda x: x["exercise"] == "memorization" and x["language"] == "en", num_proc=8)
+    ds = ds_memo.select(range(int(0.25 * len(ds_memo)), int(0.5 * len(ds_memo))))
+    ds = ds.map(lambda x: {"text": x["query"] + "\n<think>" + x["synthetic_reasoning"] + "</think>\n" + x["synthetic_answer"]})
+    return ds.shuffle(seed=42)
+
+
 if __name__ == "__main__":
     dist.init_process_group("nccl")
     rank = dist.get_rank()
@@ -79,14 +89,15 @@ if __name__ == "__main__":
     repo_name = "HuggingFaceFW/fineweb-edu-classifier"
     tokenizer = AutoTokenizer.from_pretrained(repo_name)
     model = AutoModelForSequenceClassification.from_pretrained(repo_name)
+    # model = torch.compile(model)
 
     for fp in local_parquet_files:
-        out_path = f"{output_dir}/{fp.name}"
+        out_path = f"{output_dir}/next_{fp.name}"
         if Path(out_path).exists():
             print("out_path exists", out_path)
             continue
-        docs = read_parquet(fp)["text"]
-        results = apply_classifier_language_batch(docs, batch_size=128)
+        docs = read_parquet_next(fp)["text"]
+        results = apply_classifier_language_batch(model, docs, batch_size=512)
         ds = Dataset.from_list(results)
         ds.to_parquet(out_path)
         print(f"Successfully wrote to {out_path}")

@@ -1,6 +1,7 @@
 import argparse
 import importlib
 import json
+import os
 from pathlib import Path
 
 import torch
@@ -21,7 +22,8 @@ BACKEND = "nccl"
 
 
 def shutdown():
-    dist.destroy_process_group()
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 
 def parse_args():
@@ -94,9 +96,10 @@ def train(rank, cfg: Config, args):
     cfg.trainer.save_dir = Path(cfg.trainer.save_dir)
     cfg.trainer.save_dir = cfg.trainer.save_dir / run_name
 
-    if args.world_size == 4:
-        main_rank = (args.world_size > 1 and rank == 2) or (args.world_size == 1 and rank == 0)
-    elif args.world_size == 8:
+    world_size = dist.get_world_size() if dist.is_initialized() else args.world_size
+    if world_size == 4:
+        main_rank = (world_size > 1 and rank == 2) or (world_size == 1 and rank == 0)
+    elif world_size == 8:
         main_rank = rank == 0
     else:
         main_rank = False
@@ -121,9 +124,11 @@ if __name__ == "__main__":
     cfg.optim.muon_lr = float(cfg.optim.muon_lr)
     if args.world_size > 1:
         dist.init_process_group(BACKEND)
-        if BACKEND != "gloo":
-            rank = dist.get_rank()
-            torch.cuda.set_device(f"cuda:{rank}")
+        rank = dist.get_rank()
+        if torch.cuda.is_available() and BACKEND != "gloo":
+            # With torchrun, LOCAL_RANK is the correct per-node device index.
+            local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+            torch.cuda.set_device(local_rank)
         train(rank, cfg, args)
     else:
         train(0, cfg, args)

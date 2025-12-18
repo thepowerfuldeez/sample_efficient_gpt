@@ -109,7 +109,7 @@ class AdamW(torch.optim.Optimizer):
                 state["m"] = m
                 state["v"] = v
         # return update_rms.sqrt()
-        return torch.tensor(0.0, device=device)
+        return update_rms
 
 
 def get_cosine_lr(t: int, lr_max: float, lr_min: float, warmup_steps: int, cosine_steps: int) -> float:
@@ -139,6 +139,7 @@ def get_wsd_lr(
     t: int,
     lr_max: float,
     lr_min: float,
+    zero_lr_steps: int,
     warmup_steps: int,
     decay_steps: int,
     start_decay_step: int,
@@ -158,8 +159,14 @@ def get_wsd_lr(
     """
 
     if wsd_phase == "stable":
-        if need_warmup and t < warmup_steps:
-            return t / warmup_steps * lr_max
+        if need_warmup and t < warmup_steps + zero_lr_steps:
+            if zero_lr_steps > 0:
+                if t < zero_lr_steps:
+                    return 0.0
+                elif t < zero_lr_steps + warmup_steps:
+                    return (t - zero_lr_steps) / warmup_steps * lr_max
+            elif t < warmup_steps:
+                return t / warmup_steps * lr_max
         else:
             return lr_max
     else:

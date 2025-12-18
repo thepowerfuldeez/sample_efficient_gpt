@@ -6,7 +6,6 @@ import torch._dynamo as dynamo
 import triton
 import triton.language as tl
 
-torch.cuda.set_device("cuda:0")
 torch.set_float32_matmul_precision("high")
 
 

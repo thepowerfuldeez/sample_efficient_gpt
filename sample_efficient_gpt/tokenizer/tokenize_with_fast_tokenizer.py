@@ -28,6 +28,13 @@ if int(os.getenv("STAGE", "1")) == 2:
     FINEPDFS_THRESHOLD = 2.1
     PLEIAS_SYNTH_THRESHOLD = 1.85
     print("Using thresholds from stage 2")
+elif int(os.getenv("STAGE", "1")) == 3:
+    COSMOPEDIA_THRESHOLD = 2.5
+    FINEMATH_THRESHOLD = 4.25
+    STACK_EDU_THRESHOLD = 4.25
+    FINEPDFS_THRESHOLD = 2.4
+    PLEIAS_SYNTH_THRESHOLD = 2.1
+    print("Using thresholds from stage 3")
 else:
     COSMOPEDIA_THRESHOLD = 2.0
     FINEMATH_THRESHOLD = 3.7
@@ -35,6 +42,9 @@ else:
     STACK_EDU_THRESHOLD = 3.75
     FINEPDFS_THRESHOLD = 1.75
     PLEIAS_SYNTH_THRESHOLD = 1.65
+
+# in characters
+STAGE3_LENGTH_THRESHOLD = 4000
 
 
 class TokenizerProcessor:
@@ -45,6 +55,50 @@ class TokenizerProcessor:
         escaped = [re.escape(tok) for tok in sorted(self.special_tokens, reverse=True)]
         base_tok = "<|endoftext|>"
         self.split_re = f"({'|'.join(escaped)})" if escaped else f"({re.escape(base_tok)})"
+
+    def preprocess_text(self, text):
+        stage: int = int(os.getenv("STAGE", "1"))
+        if stage == 3:
+            if "\n<think>" in text:
+                idx = text.index("\n<think>")
+                query, resp = text[:idx], text[idx:]
+                return (
+                    f"<|bos|><|user_start|>{query}<|user_end|><|assistant_start|>{resp}<|assistant_end|><|endoftext|>"
+                )
+
+            return f"<|bos|>{text}<|endoftext|>"
+        else:
+            return f"{text}<|endoftext|>"
+
+    def filter_ds(self, ds, chunk_path):
+        # for dclm-edu
+        if "dclm-edu" in str(chunk_path):
+            ds = ds.filter(
+                lambda ex: ex["metadata"]["edu_score"] > DCLM_EDU_THRESHOLD, num_proc=4, load_from_cache_file=False
+            )
+        # for finemath
+        if "finemath" in str(chunk_path):
+            ds = ds.filter(lambda ex: ex["score"] > FINEMATH_THRESHOLD, num_proc=4, load_from_cache_file=False)
+        if "cosmopedia-v2-textbook-7b" in str(chunk_path):
+            ds = ds.filter(lambda ex: ex["score"] > COSMOPEDIA_THRESHOLD, num_proc=4, load_from_cache_file=False)
+        if "stack_edu_375plus_20B" in str(chunk_path):
+            ds = ds.filter(lambda ex: ex["score"] > STACK_EDU_THRESHOLD, num_proc=4, load_from_cache_file=False)
+        if "finepdfs_en_2020plus_edu" in str(chunk_path):
+            ds = ds.filter(lambda ex: ex["score"] > FINEPDFS_THRESHOLD, num_proc=4, load_from_cache_file=False)
+        if "finepdfs-edu" in str(chunk_path):
+            ds = ds.filter(
+                lambda ex: min(ex["metadata"]["fw_edu_scores"]) > FINEPDFS_THRESHOLD,
+                num_proc=4,
+                load_from_cache_file=False,
+            )
+        if "pleias_synth" in str(chunk_path):
+            ds = ds.filter(lambda ex: ex["score"] > PLEIAS_SYNTH_THRESHOLD, num_proc=4, load_from_cache_file=False)
+
+        stage: int = int(os.getenv("STAGE", "1"))
+        if stage == 3:
+            # filter by length at stage3
+            ds = ds.filter(lambda ex: len(ex["text"]) > STAGE3_LENGTH_THRESHOLD)
+        return ds
 
     def encode_hf(self, filepath: str, tokenized_path, limit: int = -1):
         """
@@ -78,26 +132,12 @@ class TokenizerProcessor:
 
                 logger.info("read parquet")
                 ds = load_dataset("parquet", data_files=str(chunk_path), split="train")  # Arrow-backed, zero-copy-ish
-                # for dclm-edu
-                if "dclm-edu" in str(chunk_path):
-                    ds = ds.filter(
-                        lambda ex: ex["metadata"]["edu_score"] > DCLM_EDU_THRESHOLD, num_proc=4, load_from_cache_file=False
-                    )
-                # for finemath
-                if "finemath" in str(chunk_path):
-                    ds = ds.filter(lambda ex: ex["score"] > FINEMATH_THRESHOLD, num_proc=4, load_from_cache_file=False)
-                if "cosmopedia-v2-textbook-7b" in str(chunk_path):
-                    ds = ds.filter(lambda ex: ex["score"] > COSMOPEDIA_THRESHOLD, num_proc=4, load_from_cache_file=False)
-                if "stack_edu_375plus_20B" in str(chunk_path):
-                    ds = ds.filter(lambda ex: ex["score"] > STACK_EDU_THRESHOLD, num_proc=4, load_from_cache_file=False)
-                if "finepdfs_en_2020plus_edu" in str(chunk_path):
-                    ds = ds.filter(lambda ex: ex["score"] > FINEPDFS_THRESHOLD, num_proc=4, load_from_cache_file=False)
-                if "pleias_synth" in str(chunk_path):
-                    ds = ds.filter(lambda ex: ex["score"] > PLEIAS_SYNTH_THRESHOLD, num_proc=4, load_from_cache_file=False)
+                if not "all_chat" in str(chunk_path):
+                    ds = self.filter_ds(ds, chunk_path)
 
-                if not "the_stack_v2_" in str(chunk_path):
+                if not "the_stack_v2_" in str(chunk_path) and not "all_chat" in str(chunk_path):
                     ds = ds.map(
-                        lambda ex: {"text": ex["text"] + "<|endoftext|>"}, num_proc=4, load_from_cache_file=False
+                        lambda ex: {"text": self.preprocess_text(ex["text"])}, num_proc=4, load_from_cache_file=False
                     )
                 tokens, offsets = self._process_ds(ds)
                 np.save(str(out_path), tokens)
@@ -106,24 +146,34 @@ class TokenizerProcessor:
                 logger.info(f"current count: {current_count}")
         elif jsonl_files:
             # for marin-arxiv
-            # chunk_size = 50
+            chunk_size = 50
             # for everything else
-            chunk_size = 100
+            # chunk_size = 100
             chunks = [jsonl_files[i : i + chunk_size] for i in range(0, len(jsonl_files), chunk_size)]
-            for i, chunk in tqdm(list(enumerate(chunks))):
+            for i, chunk_paths in tqdm(list(enumerate(chunks))):
+                out_path = tokenized_path / f"{i}.npy"
+                offsets_path = tokenized_path / f"offsets_{i}.npy"
+                if out_path.exists():
+                    if limit > 0:
+                        current_count += np.load(str(out_path), mmap_mode="r").shape[0]
+                    logger.info(f"{str(out_path)} exists, skipping")
+                    continue
                 if token_count is not None and current_count > token_count:
                     logger.info("reached limit")
                     break
                 logger.info("read jsonl")
                 try:
-                    ds = load_dataset("json", data_files=[str(x) for x in chunk], split="train")
+                    ds = load_dataset("json", data_files=[str(x) for x in chunk_paths], split="train")
                 except:
                     logger.info("error occured while reading the dataset, skipping")
                     continue
-                ds = ds.map(lambda ex: {"text": ex["text"] + "<|endoftext|>"}, num_proc=4)
+                ds = self.filter_ds(ds, chunk_paths[0])
+                ds = ds.map(
+                    lambda ex: {"text": self.preprocess_text(ex["text"])}, num_proc=4, load_from_cache_file=False
+                )
                 tokens, offsets = self._process_ds(ds)
-                np.save(str(tokenized_path / f"{i}.npy"), tokens)
-                np.save(str(tokenized_path / f"offsets_{i}.npy"), offsets)
+                np.save(str(out_path), tokens)
+                np.save(str(offsets_path), offsets)
                 current_count += tokens.shape[0]
                 logger.info(f"current count: {current_count}")
 

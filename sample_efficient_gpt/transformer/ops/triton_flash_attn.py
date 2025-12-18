@@ -5,7 +5,6 @@ from jaxtyping import Float
 import triton
 import triton.language as tl
 
-torch.cuda.set_device("cuda:0")
 torch.set_float32_matmul_precision("high")
 
 
@@ -215,8 +214,6 @@ class TritonFlashAttnFunc(torch.autograd.Function):
         V: Float[Tensor, "*Nk d"],
         q_start: int = 0,
         is_causal: bool = True,
-        q_tile: int = 64,
-        k_tile: int = 64,
     ):
         """
         we use q_start for inference with k/v cache
@@ -235,7 +232,8 @@ class TritonFlashAttnFunc(torch.autograd.Function):
         scale = 1 / (d**0.5)
 
         out_final = torch.empty_like(Q)
-        l_final = torch.empty(bs, Nq, device=Q.device, dtype=Q.dtype)
+        # Store log-sum-exp in fp32 to avoid bf16/fp16 precision issues in backward.
+        l_final = torch.empty(bs, Nq, device=Q.device, dtype=torch.float32)
         grid = lambda meta: (triton.cdiv(Nq, meta["Q_TILE_SIZE"]), bs)
 
         flashatt_kernel_fwd[grid](
@@ -248,16 +246,15 @@ class TritonFlashAttnFunc(torch.autograd.Function):
             Nk,
             scale,
             q_start,
-            d,
-            q_tile,
-            k_tile,
-            is_causal,
+            D=d,
+            IS_CAUSAL=is_causal,
         )
         ctx.is_causal = is_causal
         ctx.save_for_backward(l_final, Q, K, V, out_final)
         return out_final
 
-    def backward(ctx, grad_output, q_tile: int = 64, k_tile: int = 64):
+    @staticmethod
+    def backward(ctx, grad_output):
         L, Q, K, V, O = ctx.saved_tensors
         bs, Nq, d = Q.shape
         Nk = K.shape[1]
@@ -271,9 +268,10 @@ class TritonFlashAttnFunc(torch.autograd.Function):
 
         grad_output, Q, K, V, O = [maybe_contiguous(x) for x in [grad_output, Q, K, V, O]]
 
-        dQ = torch.zeros_like(Q)
-        dK = torch.empty_like(K)
-        dV = torch.empty_like(V)
+        # Accumulate gradients in fp32 for numerical stability (and to avoid bf16 atomic_add issues).
+        dQ = torch.zeros((bs, Nq, d), device=Q.device, dtype=torch.float32)
+        dK = torch.zeros((bs, Nk, d), device=K.device, dtype=torch.float32)
+        dV = torch.zeros((bs, Nk, d), device=V.device, dtype=torch.float32)
 
         grid = lambda meta: (triton.cdiv(Nk, meta["K_TILE_SIZE"]), bs)
         flashatt_kernel_bwd[grid](
@@ -290,11 +288,13 @@ class TritonFlashAttnFunc(torch.autograd.Function):
             Nk,
             scale,
             D=d,
-            Q_TILE_SIZE=q_tile,
-            K_TILE_SIZE=k_tile,
+            # Empirically good defaults (see comment above the class).
+            Q_TILE_SIZE=32,
+            K_TILE_SIZE=64,
             IS_CAUSAL=ctx.is_causal,
         )
-        return dQ, dK, dV, None, None, None
+        # Match expected gradient dtypes for autograd.
+        return dQ.to(Q.dtype), dK.to(K.dtype), dV.to(V.dtype), None, None
 
 
 if __name__ == "__main__":

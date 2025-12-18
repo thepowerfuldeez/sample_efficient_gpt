@@ -108,8 +108,10 @@ class GSM8K(Task):
         # First extract the ground truth answer
         assistant_message = conversation["messages"][-1]
         assert assistant_message["role"] == "assistant", "Last message must be from the Assistant"
-        assert isinstance(assistant_message["content"], list), "This is expected to be a list of parts"
-        last_text_part = assistant_message["content"][-1]["text"]  # this contains the final answer in GSM8K
+        # assert isinstance(assistant_message["content"], list), "This is expected to be a list of parts"
+        # last_text_part = assistant_message["content"][-1]["text"]  # this contains the final answer in GSM8K
+        
+        last_text_part = assistant_message["content"].split("\n")[-1]  # this contains the final answer in GSM8K
         # Extract both the ground truth answer and the predicted answer
         ref_num = extract_answer(last_text_part)
         pred_num = extract_answer(assistant_response)
@@ -143,4 +145,4 @@ class GSM8K(Task):
                 assistant_message_parts.append({"type": "python_output", "text": result})
             else:
                 assistant_message_parts.append({"type": "text", "text": part})
-        return assistant_message_parts
+        return "\n".join([x['text'] for x in assistant_message_parts])

@@ -12,6 +12,9 @@ class DataConfig:
     val_batch_size: int = 1
     context_length: int = 1024
     seed: int = 42
+    sample_packing: bool = False
+    pad_token_id: int = 0
+    mode: str = "pretrain"  # "pretrain" or "sft"
 
 
 @dataclass(frozen=False)
@@ -27,6 +30,8 @@ class OptimConfig:
     muon_lr: float | None = None
     muon_wd: float | None = None
     muon_wd_min: float | None = None
+    # for model surgery, run with 0 lr for some time
+    zero_lr_steps: int = 0
     warmup_steps: int = 1000
     cosine_steps: int = 10_000
     seesaw_steps: tuple[int] = tuple()
@@ -41,8 +46,10 @@ class ModelConfig:
     d_ff: int = 4096
     n_layers: int = 24
     n_heads: int = 16
+    n_kv_heads: int | None = None
     vocab_size: int = 10_000
     theta: float = 10_000
+    rope_interleaved: bool = False
     weight_tying: bool = False
     attn_qknorm: bool = False
     attn_val_residual: bool = False
@@ -69,7 +76,7 @@ class TrainerConfig:
     val_every: int = 100
     # log train metrics every n steps
     log_every: int = 10
-    # can be ddp or fsdp
+    # distributed training mode (currently only 'ddp' is supported)
     dist_mode: str = "ddp"
 
 

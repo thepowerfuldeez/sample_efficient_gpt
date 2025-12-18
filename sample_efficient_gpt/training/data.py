@@ -2,7 +2,6 @@ import json
 import threading
 from pathlib import Path
 from collections.abc import Iterator
-from bisect import bisect
 
 import torch
 import torch.distributed as dist
@@ -34,7 +33,10 @@ class MemoryMappedDataset:
         """
         self._prefetch_batch = None
         self._prefetch_event = threading.Event()
+        self._prefetch_request_event = threading.Event()
         self._prefetch_lock = threading.Lock()
+        self._prefetch_thread = None
+        self._prefetch_batch_size: int | None = None
         total_length = 0
         ds = []
         lengths = [0]
@@ -179,8 +181,8 @@ class MemoryMappedDataset:
             batch_inputs = chunk[:, :-1].astype(np.int32, copy=False)
             batch_targets = chunk[:, 1:].astype(np.int32, copy=False)
             batch_inputs, batch_targets = torch.from_numpy(batch_inputs), torch.from_numpy(batch_targets)
-            batch_inputs = batch_inputs.pin_memory()
-            batch_targets = batch_targets.pin_memory()
+            # batch_inputs = batch_inputs.pin_memory()
+            # batch_targets = batch_targets.pin_memory()
             yield batch_inputs, batch_targets
 
     def _get_batch_internal(self, batch_size: int) -> tuple[Int[Tensor, "bs context"], Int[Tensor, "bs context"]]:
@@ -191,58 +193,58 @@ class MemoryMappedDataset:
         """
         if self.is_distributed:
             # We want to split unevenly across workers
-            target_log_ranks = [0]
-            small_batch_size = batch_size // self.world_size
+            if batch_size < self.world_size:
+                raise ValueError(f"batch_size ({batch_size}) must be >= world_size ({self.world_size}).")
+            base_batch_size = batch_size // self.world_size
+            remainder = batch_size % self.world_size
 
             if (
                 self.world_size == 4
                 and any(["RTX 5090" in s for s in self.gpu_names])
                 and any(["RTX 4090" in s for s in self.gpu_names])
             ):
-                target_log_ranks = [i for i in range(self.world_size) if "RTX 5090" in self.gpu_names[i]]
                 adj_n_chunks = 10
                 small_batch_size = (batch_size // adj_n_chunks) * 2
-                large_batch_size = (batch_size // adj_n_chunks) * 3
+                large_batch_size = int((batch_size // adj_n_chunks) * 3)
                 assert small_batch_size * 2 + large_batch_size * 2 == batch_size, "batch sizes don't match"
-                local_batch_size = large_batch_size if self.rank in target_log_ranks else small_batch_size
+                local_batch_size = large_batch_size if "RTX 5090" in self.gpu_names[self.rank] else small_batch_size
             else:
-                local_batch_size = small_batch_size
+                # Make sure sum(local_batch_size) == batch_size.
+                local_batch_size = base_batch_size + (1 if self.rank < remainder else 0)
         else:
             local_batch_size = batch_size
         self.local_batch_size = local_batch_size
 
-        # sampler (will be sampled deterministically at all devices)
-        sampled_indices = torch.randint(low=0, high=len(self), size=(batch_size,), generator=self.g)
-
-        if self.is_distributed:
-            # we split the work unevenly
-            if self.rank in target_log_ranks:
-                offset = self.rank * small_batch_size
-            else:
-                offset = self.rank * local_batch_size
-            local_sampled_indices = sampled_indices[offset : offset + local_batch_size]
-        else:
-            local_sampled_indices = sampled_indices
+        # Each rank samples only its local batch; gradients are weighted in Trainer.train_step().
+        local_sampled_indices = torch.randint(low=0, high=len(self), size=(local_batch_size,), generator=self.g)
 
         batch_inputs, batch_targets = self._gather_batch_numpy(local_sampled_indices.cpu().numpy())
         batch_inputs, batch_targets = torch.from_numpy(batch_inputs), torch.from_numpy(batch_targets)
         return batch_inputs, batch_targets
 
-    def _prefetch(self, batch_size):
-        batch_inputs, batch_targets = self._get_batch_internal(batch_size)
+    def _prefetch_loop(self):
+        assert self._prefetch_batch_size is not None
+        while True:
+            self._prefetch_request_event.wait()
+            self._prefetch_request_event.clear()
+            batch_inputs, batch_targets = self._get_batch_internal(self._prefetch_batch_size)
 
-        if torch.cuda.is_available():
-            batch_inputs = batch_inputs.pin_memory()
-            batch_targets = batch_targets.pin_memory()
+            if torch.cuda.is_available():
+                batch_inputs = batch_inputs.pin_memory()
+                batch_targets = batch_targets.pin_memory()
 
-        with self._prefetch_lock:
-            self._prefetch_batch = (batch_inputs, batch_targets)
-            self._prefetch_event.set()  # mark ready
+            with self._prefetch_lock:
+                self._prefetch_batch = (batch_inputs, batch_targets)
+                self._prefetch_event.set()  # mark ready
 
     def get_batch(self, batch_size):
-        # First ever call: compute synchronously
-        if self._prefetch_batch is None and not self._prefetch_event.is_set():
-            self._prefetch(batch_size)
+        if self._prefetch_thread is None:
+            self._prefetch_batch_size = batch_size
+            self._prefetch_thread = threading.Thread(target=self._prefetch_loop, daemon=True)
+            self._prefetch_request_event.set()
+            self._prefetch_thread.start()
+        elif batch_size != self._prefetch_batch_size:
+            raise ValueError(f"MemoryMappedDataset.get_batch() batch_size changed: {batch_size} != {self._prefetch_batch_size}")
 
         # Wait until a prefetched batch is ready
         self._prefetch_event.wait()
@@ -253,8 +255,8 @@ class MemoryMappedDataset:
             # reset the flag so the next prefetch can signal again
             self._prefetch_event.clear()
 
-        # Kick off prefetch of the *next* batch in the background
-        threading.Thread(target=self._prefetch, args=(batch_size,), daemon=True).start()
+        # Request prefetch of the next batch.
+        self._prefetch_request_event.set()
 
         return out
 

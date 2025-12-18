@@ -1,0 +1,138 @@
+base: gpt_small_faster
+model_main: &model_main
+  vocab_size: 49152
+  attn_qknorm: true
+  attn_gating: per-head
+  attn_val_residual: true
+  d_model: 1152
+  d_ff: 3072
+  n_layers: 30
+  n_heads: 18
+  n_kv_heads: 6
+  weight_tying: true
+  layernorm_scaling: true
+
+trainer_base: &trainer_base
+  dist_mode: ddp
+  save_dir: /mnt/harddrive/checkpoints
+  val_every: 5000
+  run_name: "{date}_main_run_mix"
+
+optim_base: &optim_base
+  scheduler: wsd
+  muon_wd: 0.1
+  muon_lr: 1.1e-2
+  lr: 6e-3
+  warmup_steps: 20000
+  wsd_need_warmup: true
+  wsd_phase: stable
+
+data_mix: &data_mix
+  tokenizer_path: HuggingFaceTB/SmolLM2-135M
+  validation_path: /home/george/sample_efficient_gpt/sample_efficient_gpt/data_smollm2_imu/val.npy
+  train_path: 1215_data_mix.json
+  context_length: 704
+  batch_size: 60
+  val_batch_size: 12
+
+base_experiment: &base_experiment
+  model: *model_main
+  trainer: *trainer_base
+  optim: *optim_base
+  data: *data_mix
+
+experiments:
+  stable:
+    <<: *base_experiment
+    trainer:
+      <<: *trainer_base
+      run_name: "{date}_smollm_imu_stable"
+      gradient_accumulation_steps: 8
+      max_steps: 1000000
+      save_every: 5000
+      # load_from: /mnt/harddrive/checkpoints/1215_smollm_conversion/smollm2_imu_wide2x_gqa_extras_qknormrms_g8.pt
+      load_from: /mnt/harddrive/checkpoints/1216_smollm_imu_stable/260000.pt
+    optim:
+      <<: *optim_base
+      muon_lr: 1.1e-2
+      zero_lr_steps: 1000
+      warmup_steps: 5000
+    data:
+      <<: *data_mix
+
+  main_run_mix_decay:
+    <<: *base_experiment
+    trainer:
+      <<: *trainer_base
+      run_name: "{date}_main_run_mix_decay"
+      gradient_accumulation_steps: 8
+      max_steps: 1950000
+      save_every: 5000
+      load_from: /mnt/harddrive/checkpoints/1115_main_run_mix_decay/1450000.pt
+      # load_from: /mnt/harddrive/checkpoints/1113_main_run_mix/1300000.pt
+    optim:
+      <<: *optim_base
+      lr_min_coeff: 0.1
+      muon_lr: 1.22e-2
+      wsd_need_warmup: false
+      wsd_phase: decay
+      wsd_decay_step: 1300000
+    data:
+      tokenizer_path: tokenizer/trained_tokenizers/mix_bpe_hf
+      validation_path: /home/george/sample_efficient_gpt/sample_efficient_gpt/data_dclm_edu/tokenized_65536/val.npy
+      train_path: 1207_data_mix_stage2.json
+      context_length: 1088
+      batch_size: 52
+      val_batch_size: 8
+      seed: 43
+
+  main_run_mix_midtrain_stable:
+    <<: *base_experiment
+    trainer:
+      <<: *trainer_base
+      run_name: "{date}_main_run_mix_midtrain"
+      gradient_accumulation_steps: 10
+      max_steps: 37500
+      save_every: 5000
+      val_every: 2500
+      load_from: /mnt/harddrive/checkpoints/1118_main_run_mix_midtrain/20000.pt
+    optim:
+      scheduler: wsd
+      muon_wd: 0.1
+      muon_lr: 1.32e-3
+      warmup_steps: 2000
+      wsd_need_warmup: true
+      wsd_phase: stable
+    data:
+      tokenizer_path: tokenizer/trained_tokenizers/mix_bpe_hf2
+      validation_path: /home/george/sample_efficient_gpt/sample_efficient_gpt/data_midtrain/val.npy
+      train_path: /home/george/sample_efficient_gpt/sample_efficient_gpt/data_midtrain/train
+      context_length: 1024
+      batch_size: 40
+      val_batch_size: 10
+
+  main_run_mix_midtrain_decay:
+    <<: *base_experiment
+    trainer:
+      <<: *trainer_base
+      run_name: "{date}_main_run_mix_midtrain"
+      gradient_accumulation_steps: 10
+      max_steps: 50000
+      save_every: 5000
+      val_every: 2500
+      load_from: /mnt/harddrive/checkpoints/1121_main_run_mix_midtrain/37500.pt
+    optim:
+      scheduler: wsd
+      muon_wd: 0.1
+      muon_lr: 1.32e-3
+      warmup_steps: 2000
+      wsd_need_warmup: false
+      wsd_phase: decay
+      wsd_decay_step: 37500
+    data:
+      tokenizer_path: tokenizer/trained_tokenizers/mix_bpe_hf2
+      validation_path: /home/george/sample_efficient_gpt/sample_efficient_gpt/data_midtrain/val.npy
+      train_path: /home/george/sample_efficient_gpt/sample_efficient_gpt/data_midtrain/train
+      context_length: 1024
+      batch_size: 40
+      val_batch_size: 10

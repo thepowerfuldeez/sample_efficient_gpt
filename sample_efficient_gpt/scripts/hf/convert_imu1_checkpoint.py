@@ -21,39 +21,42 @@ DEFAULT_SAMPLE_ROOT = Path("/home/george/sample_efficient_gpt")
 
 
 CHAT_TEMPLATE = """
-{{- '<|bos|>' }}
-{%- set ns = namespace(first_system='', injected=false) %}
-{%- if messages and messages[0].role == 'system' %}
-    {%- set ns.first_system = messages[0].content %}
-{%- endif %}
+{{- '<|bos|>' -}}
+{%- set ns = namespace(first_system='', injected=false) -%}
+{%- if messages and messages[0].role == 'system' -%}
+    {%- set ns.first_system = messages[0].content -%}
+{%- endif -%}
 
-{%- for message in messages %}
-    {%- if message.content is string %}
-        {%- set content = message.content %}
-    {%- else %}
-        {%- set content = '' %}
-    {%- endif %}
-    {%- if message.role == "user" %}
-        {%- if ns.first_system and not ns.injected %}
-            {{- '<|user_start|>' + ns.first_system + '\\n\\n' + content + '<|user_end|>' }}
-            {%- set ns.injected = true %}
-        {% else %}
-            {{- '<|user_start|>' + content + '<|user_end|>' }}
-        {% endif %}
-    {%- elif message.role == "assistant" %}
-        {{- '<|assistant_start|>' }}
-        {% generation %}
-        {{- content + '<|assistant_end|>' }}
-        {% endgeneration %}
-    {%- endif %}
-{%- endfor %}
-{%- if add_generation_prompt %}
-    {{- '<|assistant_start|>' }}
-{%- else %}
-    {% generation %}
-    {{- '<|endoftext|>' }}
-    {% endgeneration %}
-{%- endif %}
+{%- for message in messages -%}
+    {%- if message.content is string -%}
+        {%- set content = message.content -%}
+    {%- else -%}
+        {%- set content = '' -%}
+    {%- endif -%}
+
+    {%- if message.role == "user" -%}
+        {%- if ns.first_system and not ns.injected -%}
+            {{- '<|user_start|>' + ns.first_system + '\n\n' + content + '<|user_end|>' -}}
+            {%- set ns.injected = true -%}
+        {%- else -%}
+            {{- '<|user_start|>' + content + '<|user_end|>' -}}
+        {%- endif -%}
+
+    {%- elif message.role == "assistant" -%}
+        {{- '<|assistant_start|>' -}}
+        {% generation -%}
+        {{- content + '<|assistant_end|>' -}}
+        {%- endgeneration %}
+    {%- endif -%}
+{%- endfor -%}
+
+{%- if add_generation_prompt -%}
+    {{- '<|assistant_start|>' -}}
+{%- else -%}
+    {% generation -%}
+    {{- '<|endoftext|>' -}}
+    {%- endgeneration %}
+{%- endif -%}
 """
 
 

@@ -41,6 +41,9 @@ class DDP(nn.Module):
         self.bucket_to_names = {}
         for n, bucket_idx in self.buckets_map.items():
             self.bucket_to_names.setdefault(bucket_idx, []).append(n)
+        self.bucket_name_to_pos = {
+            bucket_idx: {name: i for i, name in enumerate(names)} for bucket_idx, names in self.bucket_to_names.items()
+        }
 
         for n, p in self.module.named_parameters():
             if p.is_leaf and p.requires_grad:
@@ -56,6 +59,7 @@ class DDP(nn.Module):
 
                 p.register_post_accumulate_grad_hook(make_hook())
         self._should_all_reduce = True
+        # (work, flat_reduced, grads, target_dtype)
         self.handles = []
 
         self.total_bytes = 0
@@ -63,7 +67,6 @@ class DDP(nn.Module):
         self.buckets = {
             bucket_idx: [None for _ in range(len(names))] for bucket_idx, names in self.bucket_to_names.items()
         }
-        self.comm_stream = torch.cuda.Stream()
 
     def _hook(self, bucket_idx: int, param_name: str, p: Tensor) -> None:
         """
@@ -78,33 +81,27 @@ class DDP(nn.Module):
             # self.buckets.setdefault(bucket_idx, []).append(g)
             # find position
             # print(f"[rank={dist.get_rank()}] looking for {param_name} in {self.bucket_to_names[bucket_idx]} with {bucket_idx=}")
-            grad_position = self.bucket_to_names[bucket_idx].index(param_name)
+            grad_position = self.bucket_name_to_pos[bucket_idx][param_name]
             self.buckets[bucket_idx][grad_position] = g
             # print(
             #     f"[rank={dist.get_rank()}] grad shape {g.shape}, collecting grad to a bucket {bucket_idx}, cur count {len(self.buckets[bucket_idx])}, needed {len(self.bucket_to_names[bucket_idx])}"
             # )
 
             # no more None left
-            bucket_is_full = not [x for x in self.buckets[bucket_idx] if x is None]
+            bucket_is_full = all(x is not None for x in self.buckets[bucket_idx])
             if bucket_is_full:
                 group = self.buckets.pop(bucket_idx)
                 self.buckets[bucket_idx] = [None for _ in range(len(group))]
                 flat = torch._utils._flatten_dense_tensors(group)
-                ready = torch.cuda.Event()
-                torch.cuda.current_stream().record_event(ready)
-                with torch.cuda.stream(self.comm_stream):
-                    self.comm_stream.wait_event(ready)
-                    handle = dist.all_reduce(flat.bfloat16(), dist.ReduceOp.SUM, async_op=True)
-
-                    def _on_finish(_, flat=flat, group=group):
-                        flat = flat.to(group[0].dtype)
-                        torch._utils._unflatten_dense_tensors(flat, group)
-                handle.get_future().then(_on_finish)
+                # Reduce a dense flat buffer, then copy the reduced values back into the original .grad tensors.
+                # Using an explicit flat buffer avoids per-parameter collectives.
+                flat_reduced = flat.to(torch.bfloat16)
+                work = dist.all_reduce(flat_reduced, dist.ReduceOp.SUM, async_op=True)
                 # print(
                 #     f"[rank={dist.get_rank()}] grad shape {g.shape} flat shape {flat.shape}, sending all reduce with bucket {bucket_idx}, "
                 #     f"now bucket_idx is in self.buckets: {bucket_idx in self.buckets}"
                 # )
-                self.handles.append(handle)
+                self.handles.append((work, flat_reduced, group, flat.dtype))
 
     @contextmanager
     def no_sync(self):
@@ -121,8 +118,13 @@ class DDP(nn.Module):
     def finish_gradient_synchronization(self) -> float:
         t0 = time.monotonic()
 
-        for h in self.handles:
-            h.wait()
+        for work, flat_reduced, group, flat_dtype in self.handles:
+            work.wait()
+            flat_out = flat_reduced.to(flat_dtype)
+            # Returns a list of tensors matching `group`'s shapes.
+            unflattened = torch._utils._unflatten_dense_tensors(flat_out, group)
+            for dst, src in zip(group, unflattened):
+                dst.copy_(src)
         self.handles.clear()
 
         time_comm = time.monotonic() - t0

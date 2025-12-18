@@ -362,7 +362,7 @@ class LigerFusedAddRMSNormFunction(torch.autograd.Function):
 
     @staticmethod
     @ensure_contiguous
-    def forward(ctx, X, R, W, eps, offset=0.0, casting_mode="llama", in_place=False):
+    def forward(ctx, X, R, W, eps, offset=0.0, casting_mode="llama", in_place=True):
         """
         X: (B, T, H) or (BxT, H)
         W: (H,)

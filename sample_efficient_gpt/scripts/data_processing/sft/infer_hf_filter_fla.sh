@@ -25,7 +25,7 @@ launch_chunk() {
   local e=$2
   local outfile="${OUT_DIR}/fla_select_${s}_${e}.jsonl"
   echo "Launching chunk ${s}-${e} -> ${outfile}"
-  python scripts/infer_hf_filter_fla.py \
+  python scripts/data_processing/sft/infer_hf_filter_fla.py \
     --data-file "${DATA}" \
     --start "${s}" \
     --end "${e}" \

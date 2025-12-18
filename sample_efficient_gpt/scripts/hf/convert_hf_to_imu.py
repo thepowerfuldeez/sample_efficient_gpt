@@ -15,7 +15,7 @@ checkpoint format:
 
 Usage example:
 
-  python convert_hf_to_sample_imu1.py \
+  python convert_hf_to_imu.py \
       --hf-dir imu1_converted \
       --output /mnt/harddrive/checkpoints/from_hf/imu1_from_hf.pt
 
