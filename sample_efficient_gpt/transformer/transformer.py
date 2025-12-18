@@ -50,6 +50,7 @@ class Block(nn.Module):
         moe_z_loss_coef: float = 0.0,
         moe_router_jitter: float = 0.0,
         moe_normalize_gates: bool = True,
+        moe_gate_scale: float = 1.0,
         moe_expert_parallel_size: int = 1,
         moe_expert_precision: str = "bf16",
         attn_qknorm: bool = False,
@@ -90,6 +91,7 @@ class Block(nn.Module):
                 z_loss_coef=moe_z_loss_coef,
                 router_jitter=moe_router_jitter,
                 normalize_gates=moe_normalize_gates,
+                gate_scale=moe_gate_scale,
                 expert_parallel_size=moe_expert_parallel_size,
                 expert_precision=moe_expert_precision,
                 device=device,
@@ -151,6 +153,7 @@ class Transformer(nn.Module):
         moe_z_loss_coef: float = 0.0,
         moe_router_jitter: float = 0.0,
         moe_normalize_gates: bool = True,
+        moe_gate_scale: float = 1.0,
         moe_expert_parallel_size: int = 1,
         moe_expert_precision: str = "bf16",
         moe_start_layer: int = 0,
@@ -169,6 +172,7 @@ class Transformer(nn.Module):
         self.moe_z_loss_coef = float(moe_z_loss_coef)
         self.moe_router_jitter = float(moe_router_jitter)
         self.moe_normalize_gates = bool(moe_normalize_gates)
+        self.moe_gate_scale = float(moe_gate_scale)
         self.moe_expert_parallel_size = int(moe_expert_parallel_size)
         self.moe_expert_precision = str(moe_expert_precision)
         self.moe_start_layer = int(moe_start_layer)
@@ -200,6 +204,7 @@ class Transformer(nn.Module):
                     moe_z_loss_coef=self.moe_z_loss_coef,
                     moe_router_jitter=self.moe_router_jitter,
                     moe_normalize_gates=self.moe_normalize_gates,
+                    moe_gate_scale=self.moe_gate_scale,
                     moe_expert_parallel_size=self.moe_expert_parallel_size,
                     moe_expert_precision=self.moe_expert_precision,
                     theta=theta,

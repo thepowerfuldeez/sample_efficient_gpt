@@ -41,6 +41,7 @@ class TopKMoE(nn.Module):
         z_loss_coef: float = 0.0,
         router_jitter: float = 0.0,
         normalize_gates: bool = True,
+        gate_scale: float = 1.0,
         expert_parallel_size: int = 1,
         expert_precision: str = "bf16",
         device=None,
@@ -65,6 +66,7 @@ class TopKMoE(nn.Module):
         self.z_loss_coef = float(z_loss_coef)
         self.router_jitter = float(router_jitter)
         self.normalize_gates = bool(normalize_gates)
+        self.gate_scale = float(gate_scale)
         self.expert_parallel_size = int(expert_parallel_size)
         self.expert_precision = str(expert_precision)
         self._fp8_converted = False
@@ -202,6 +204,10 @@ class TopKMoE(nn.Module):
             expert_idx = topk_idx.reshape(-1)  # [T*K]
             aux_loss = self._aux_loss(router_logits, router_probs, topk_idx[:, 0])
 
+        gate_raw = gate
+        if self.gate_scale != 1.0:
+            gate = gate * self.gate_scale
+
         if os.environ.get("SEGPT_LOG_MOE_STATS", "0") == "1":
             with torch.no_grad():
                 counts = torch.bincount(expert_idx.to(torch.int64), minlength=self.num_experts).to(torch.float32)
@@ -212,7 +218,7 @@ class TopKMoE(nn.Module):
                 self.last_stats = {
                     "load_max_frac": p.max(),
                     "load_ent_norm": ent_norm,
-                    "gate_mean": gate.mean().to(torch.float32),
+                    "gate_mean": gate_raw.mean().to(torch.float32),
                     "logits_std": router_logits.float().std(),
                 }
 

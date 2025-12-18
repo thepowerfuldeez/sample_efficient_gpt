@@ -64,6 +64,8 @@ class ModelConfig:
     moe_z_loss_coef: float = 0.0
     moe_router_jitter: float = 0.0
     moe_normalize_gates: bool = True
+    # Scales router gates applied to expert outputs (e.g. 10.0 increases router/expert signal strength).
+    moe_gate_scale: float = 1.0
     # expert parallelism (currently supports moe_expert_parallel_size == world_size)
     moe_expert_parallel_size: int = 1
     # expert matmul precision mode (best-effort; may fall back depending on environment)
