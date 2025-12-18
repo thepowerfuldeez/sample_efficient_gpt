@@ -249,6 +249,12 @@ class Trainer:
             self.model.eval()
             self.optimizers = None
 
+        # Torch compile is brittle with dynamic all-to-all token dispatch in EP MoE (shapes change step-to-step).
+        # In practice this can lead to excessive recompiles and/or hangs across ranks during validation.
+        if self.using_expert_parallel and compile:
+            logger.warning("Disabling torch.compile because expert-parallel MoE is enabled.")
+            compile = False
+
         if self.cfg.optim.scheduler == "wsd" and self.cfg.optim.wsd_phase == "decay":
             self.start_decay_step = self.cfg.optim.wsd_decay_step or self.iteration
             self.decay_steps = self.cfg.trainer.max_steps - self.start_decay_step
@@ -677,9 +683,17 @@ class Trainer:
                 elif self.rank_zero_only:
                     self.save_state()
 
-            if self.rank_zero_only:
-                run_eval = self.val_dataset is not None and not os.getenv("NO_VAL", "0") == "1"
-                if run_eval and self.iteration > 0 and self.iteration % self.cfg.trainer.val_every == 0:
+            run_eval = self.val_dataset is not None and not os.getenv("NO_VAL", "0") == "1"
+            need_eval = run_eval and self.iteration > 0 and self.iteration % self.cfg.trainer.val_every == 0
+            if need_eval:
+                if self.using_expert_parallel and self.is_distributed:
+                    # EP MoE forward uses collectives; all ranks must enter validation together.
+                    dist.barrier()
+                    val_metrics = self.validate()
+                    dist.barrier()
+                    if self.rank_zero_only:
+                        self.log(val_metrics)
+                elif self.rank_zero_only:
                     val_metrics = self.validate()
                     self.log(val_metrics)
 
