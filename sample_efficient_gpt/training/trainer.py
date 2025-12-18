@@ -33,7 +33,7 @@ from sample_efficient_gpt.training import (
 from sample_efficient_gpt.config_schema import Config
 from sample_efficient_gpt.utils.logger import logger
 from sample_efficient_gpt.utils.config_tools import load_config, apply_overrides
-from sample_efficient_gpt.training.sft_dataset import SFTDataset
+# from sample_efficient_gpt.training.sft_dataset import SFTDataset
 
 from sample_efficient_gpt.training.distributed import DDP
 
@@ -129,6 +129,7 @@ class Trainer:
         self.model.to(self.cfg.trainer.device)
         load_from = load_from or self.cfg.trainer.load_from
         if load_from is not None:
+            load_from = Path(load_from)
             self.load_state(load_from, model_only=True)
 
         # If requested, convert only MoE experts to float8 before DDP/optimizer init.
@@ -137,7 +138,7 @@ class Trainer:
             self.model.maybe_convert_moe_experts_to_fp8()
 
         # maximum achievable is 90% for bf16; 80% for fp8
-        flops_multiplier = 0.9 if not self.cfg.trainer.use_fp8 else 1.6
+        flops_multiplier = 0.9 if not (self.cfg.trainer.use_fp8 or self.cfg.model.moe_expert_precision == "fp8") else 1.6
         if self.is_distributed:
             if self.cfg.trainer.dist_mode == "ddp":
                 self.model = DDP(self.model)
@@ -165,7 +166,7 @@ class Trainer:
             named_params.append((n, p))
             unique_params.setdefault(id(p), p.numel())
 
-        self.total_params = int(sum(unique_params.values()))
+        self.total_params = int(sum(unique_params.values())) * self.world_size
         embedding_params = int(getattr(getattr(model_for_count, "embedding", None), "weight", torch.empty(0)).numel())
         self.total_non_emb_params = int(self.total_params - embedding_params)
 
@@ -199,7 +200,7 @@ class Trainer:
 
         if load_components == "all":
             self._init_optimizers()
-            if load_from is not None:
+            if load_from is not None and not self.using_expert_parallel:
                 self.load_state(load_from, model_only=False, optimizers_only=True)
 
             logger.info(f"Model is created with hparams {self.cfg.model}")
