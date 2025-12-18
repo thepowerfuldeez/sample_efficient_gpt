@@ -156,15 +156,29 @@ class Trainer:
             # 209.5TFLOPS of compute in bf16 when using 1 gpu
             self.available_flops = 209.5e12 * flops_multiplier
 
-        layer_params = (
-            4 * self.cfg.model.d_model**2
-            + 2 * self.cfg.model.d_model
-            + 2 * self.cfg.model.d_model * self.cfg.model.d_ff
-        )
-        self.total_params = self.cfg.model.n_layers * layer_params + self.cfg.model.d_model * self.cfg.model.vocab_size
+        # Parameter counting: use the instantiated model instead of a dense-only closed-form.
+        # This stays correct under optional components (MoE, qk-norm, attention gating, etc).
+        model_for_count = getattr(self.model, "module", self.model)
+        unique_params: dict[int, int] = {}
+        named_params: list[tuple[str, torch.nn.Parameter]] = []
+        for n, p in model_for_count.named_parameters(recurse=True):
+            named_params.append((n, p))
+            unique_params.setdefault(id(p), p.numel())
+
+        self.total_params = int(sum(unique_params.values()))
+        embedding_params = int(getattr(getattr(model_for_count, "embedding", None), "weight", torch.empty(0)).numel())
+        self.total_non_emb_params = int(self.total_params - embedding_params)
+
+        layer_param_counts = []
+        for layer_idx in range(int(self.cfg.model.n_layers)):
+            prefix = f"blocks.{layer_idx}."
+            layer_param_counts.append(int(sum(p.numel() for n, p in named_params if n.startswith(prefix))))
+        avg_layer_params = float(sum(layer_param_counts) / max(1, len(layer_param_counts)))
+
         logger.info(
-            f"Created a model with {layer_params / 1e6:.2f}M layer and "
-            f"{self.total_params / 1e6:.1f}M total non-emb params"
+            f"Created a model with {avg_layer_params / 1e6:.2f}M avg layer params and "
+            f"{self.total_params / 1e6:.1f}M total params "
+            f"({self.total_non_emb_params / 1e6:.1f}M non-emb)"
         )
         if self.wandb is not None and self.rank_zero_only:
             self.wandb.log(
