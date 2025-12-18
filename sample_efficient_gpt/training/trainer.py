@@ -633,8 +633,32 @@ class Trainer:
                 for k, p in getattr(self.model, "module", self.model).named_parameters()
                 if "attn" in k or "ffn" in k
             }
+            moe_stats = {}
+            if os.environ.get("SEGPT_LOG_MOE_STATS", "0") == "1":
+                from sample_efficient_gpt.transformer.moe import TopKMoE
+
+                load_max_fracs = []
+                load_ent_norms = []
+                gate_means = []
+                logits_stds = []
+                for m in getattr(self.model, "module", self.model).modules():
+                    if isinstance(m, TopKMoE) and getattr(m, "last_stats", None):
+                        st = m.last_stats
+                        load_max_fracs.append(st["load_max_frac"].detach().float())
+                        load_ent_norms.append(st["load_ent_norm"].detach().float())
+                        gate_means.append(st["gate_mean"].detach().float())
+                        logits_stds.append(st["logits_std"].detach().float())
+                if load_max_fracs:
+                    moe_stats = {
+                        "moe/load_max_frac": torch.stack(load_max_fracs).mean(),
+                        "moe/load_ent_norm": torch.stack(load_ent_norms).mean(),
+                        "moe/gate_mean": torch.stack(gate_means).mean(),
+                        "moe/logits_std": torch.stack(logits_stds).mean(),
+                        "moe/n_layers": float(len(load_max_fracs)),
+                    }
         else:
             parameter_norms = {}
+            moe_stats = {}
         # scale reported loss if it's superbpe
         train_loss = loss.detach() * self.train_loss_multiplier
         z_loss = z_loss.detach() * self.train_loss_multiplier
@@ -650,6 +674,7 @@ class Trainer:
             "time_comm": time_comm,
             # f"rank_{self.rank}_fwd_bwd": start.elapsed_time(end) / 1e3,
             f"rank_{self.rank}_fwd_bwd": 0,
+            **moe_stats,
         }
         if iter_wd is not None:
             log["wd"] = iter_wd

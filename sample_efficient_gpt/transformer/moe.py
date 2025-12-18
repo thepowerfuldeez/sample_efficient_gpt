@@ -1,4 +1,5 @@
 import math
+import os
 
 import torch
 import torch.nn as nn
@@ -67,6 +68,7 @@ class TopKMoE(nn.Module):
         self.expert_parallel_size = int(expert_parallel_size)
         self.expert_precision = str(expert_precision)
         self._fp8_converted = False
+        self.last_stats: dict[str, Tensor] | None = None
 
         # Bias matters for stable initialization / upcycling.
         self.router = nn.Linear(self.d_model, self.num_experts, bias=True, device=device, dtype=dtype)
@@ -198,6 +200,20 @@ class TopKMoE(nn.Module):
             gate = topk_probs.reshape(-1)  # [T*K]
             expert_idx = topk_idx.reshape(-1)  # [T*K]
             aux_loss = self._aux_loss(router_logits, router_probs, topk_idx[:, 0])
+
+        if os.environ.get("SEGPT_LOG_MOE_STATS", "0") == "1":
+            with torch.no_grad():
+                counts = torch.bincount(expert_idx.to(torch.int64), minlength=self.num_experts).to(torch.float32)
+                denom = counts.sum().clamp_min(1.0)
+                p = counts / denom
+                ent = -(p * (p.clamp_min(1e-20).log())).sum()
+                ent_norm = ent / float(math.log(self.num_experts)) if self.num_experts > 1 else ent
+                self.last_stats = {
+                    "load_max_frac": p.max(),
+                    "load_ent_norm": ent_norm,
+                    "gate_mean": gate.mean().to(torch.float32),
+                    "logits_std": router_logits.float().std(),
+                }
 
         if not self._ep_enabled:
             tokens_per_expert = tokens if self.top_k == 1 else tokens * self.top_k
