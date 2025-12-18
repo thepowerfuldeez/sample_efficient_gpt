@@ -143,7 +143,7 @@ def forward_model(model, input_ids):
     batch_size, seq_len = input_ids.size()
     out = model(input_ids)
     if isinstance(out, tuple):
-        outputs, _ = out
+        outputs = out[0]
     # huggingface
     elif hasattr(out, "logits"):
         outputs = out.logits

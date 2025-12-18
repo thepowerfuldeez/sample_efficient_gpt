@@ -111,6 +111,16 @@ class Trainer:
             # always keep master weights in fp32
             dtype=torch.float32,
             weight_tying=self.cfg.model.weight_tying,
+            moe_num_experts=self.cfg.model.moe_num_experts,
+            moe_top_k=self.cfg.model.moe_top_k,
+            moe_capacity_factor=self.cfg.model.moe_capacity_factor,
+            moe_aux_loss_coef=self.cfg.model.moe_aux_loss_coef,
+            moe_z_loss_coef=self.cfg.model.moe_z_loss_coef,
+            moe_router_jitter=self.cfg.model.moe_router_jitter,
+            moe_normalize_gates=self.cfg.model.moe_normalize_gates,
+            moe_start_layer=self.cfg.model.moe_start_layer,
+            moe_every_n_layers=self.cfg.model.moe_every_n_layers,
+            moe_end_layer=self.cfg.model.moe_end_layer,
         )
         self.model.to(self.cfg.trainer.device)
         load_from = load_from or self.cfg.trainer.load_from
@@ -388,7 +398,7 @@ class Trainer:
                 torch.no_grad(),
                 torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.cfg.trainer.dtype == "bfloat16"),
             ):
-                logits, _ = self.model(inputs)
+                logits, *_ = self.model(inputs)
                 val_loss, _, val_loss_bpb = efficient_cross_entropy(
                     logits,
                     targets,
@@ -489,7 +499,7 @@ class Trainer:
 
         autocast_ctx = torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.cfg.trainer.dtype == "bfloat16")
         with autocast_ctx:
-            logits, avg_kurtosis_values = self.model(inputs)
+            logits, avg_kurtosis_values, moe_aux_loss = self.model(inputs)
             # using bits-per-bytes formulation of loss
             loss, z_loss, loss_bpb = efficient_cross_entropy(
                 logits,
@@ -508,7 +518,7 @@ class Trainer:
             coef *= self.train_dataset.local_batch_size / self.cfg.data.batch_size
 
         # fused loss implementation already includes z_loss with coef
-        loss_for_backward = (loss + z_loss_weight * z_loss) * coef
+        loss_for_backward = (loss + z_loss_weight * z_loss + moe_aux_loss) * coef
 
         if self.is_distributed and hasattr(self.model, "no_sync") and not is_accum_boundary:
             context = self.model.no_sync()
@@ -555,6 +565,7 @@ class Trainer:
             "train_loss": train_loss,
             "train_loss_bpb": loss_bpb,
             "z_loss": z_loss,
+            "moe_aux_loss": moe_aux_loss.detach(),
             "grad_norm": grad_norm,
             "learning_rate": iter_lr,
             "avg_kurtosis": avg_kurtosis_values,
@@ -632,6 +643,7 @@ class Trainer:
                         "train/loss": step_stats["train_loss"],
                         "train/loss_bpb": step_stats["train_loss_bpb"],
                         "train/z_loss": step_stats["z_loss"],
+                        "train/moe_aux_loss": step_stats["moe_aux_loss"],
                         "train/grad_norm": step_stats["grad_norm"],
                         "train/learning_rate": step_stats["learning_rate"],
                         **({"train/wd": step_stats["wd"]} if "wd" in step_stats else {}),

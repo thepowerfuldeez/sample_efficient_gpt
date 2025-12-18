@@ -16,6 +16,9 @@ Main achievements that makes this framework stand out across others:
 8. SuperBPE tokenizer with the conversion to HF tokenizers (https://arxiv.org/abs/2503.13423)
 9. Individual WD for muP transfer + Cautious Weight Decay (https://arxiv.org/abs/2510.12402)
 
+Experimental (use at your own risk):
+10. Token-level MoE FFN (top-k routing, load-balancing aux loss)
+
 
 Various optimization tricks, such as momentum warmup, WD schedule
 
@@ -62,8 +65,31 @@ Note that you have to provide both train and validation datasets in tokenized fo
 * FSDP
 * Evals (X)
 * FP8 training (+-)
-* MoE
+* MoE (experimental ✅)
 
 Not fully verified:
 - Seesaw schedule
 - Prodigy optimizer
+
+### Quick MoE try (B200-friendly)
+Set these in your YAML (e.g. `configs/smollm2_wide.yaml` under `model:`) to increase parameter count at ~same per-token compute:
+```yaml
+model:
+  moe_num_experts: 8        # 0 disables MoE
+  moe_top_k: 1              # top-1 routing (Switch-style)
+  moe_capacity_factor: 1.25 # avoid drops; increase if you see drops/instability
+  moe_aux_loss_coef: 0.01   # load balancing
+  moe_z_loss_coef: 0.0      # optional router z-loss
+  moe_router_jitter: 0.0    # e.g. 0.01 for noisy routing
+  moe_start_layer: 0
+  moe_every_n_layers: 1     # apply MoE to every layer
+  moe_end_layer: null
+trainer:
+  compile: false            # MoE routing is Python-heavy; disable torch.compile initially
+```
+
+Useful perf toggles (environment variables):
+- `SEGPT_RMSNORM_IMPL=liger` (fused RMSNorm)
+- `SEGPT_SWIGLU_IMPL=liger` (fused SiLU*mul inside SwiGLU)
+- `SEGPT_ATTN_IMPL=triton` / `SEGPT_QKNORM_ATTN_IMPL=triton` (Triton attention kernels)
+- `SEGPT_TRACK_KURTOSIS=0` (disable kurtosis computation)

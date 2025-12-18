@@ -108,7 +108,7 @@ def train(rank, cfg: Config, args):
         run = wandb.init(project=cfg.project, name=run_name, config=dataclass_to_nested_dict(cfg))
     else:
         run = None
-    trainer = Trainer(cfg, load_from=args.load_from, wandb=run)
+    trainer = Trainer(cfg, load_from=args.load_from, wandb=run, compile=cfg.trainer.compile)
     trainer.train()
 
     if main_rank:

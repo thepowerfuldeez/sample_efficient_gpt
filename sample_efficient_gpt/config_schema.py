@@ -55,6 +55,19 @@ class ModelConfig:
     attn_val_residual: bool = False
     attn_gating: bool = False
     layernorm_scaling: bool = False
+    # --- MoE (token-level, no expert-parallel) ---
+    # 0 disables MoE
+    moe_num_experts: int = 0
+    moe_top_k: int = 1
+    moe_capacity_factor: float = 1.0
+    moe_aux_loss_coef: float = 0.01
+    moe_z_loss_coef: float = 0.0
+    moe_router_jitter: float = 0.0
+    moe_normalize_gates: bool = True
+    # apply MoE to layers in [start, end) every N layers
+    moe_start_layer: int = 0
+    moe_every_n_layers: int = 1
+    moe_end_layer: int | None = None
 
 
 @dataclass(frozen=False)
@@ -63,6 +76,7 @@ class TrainerConfig:
     device: str = "cuda"
     dtype: Literal["float32", "bfloat16"] = "float32"
     use_fp8: bool = False
+    compile: bool = True
     max_steps: int = 200_000
     z_loss_weight: float = 1e-4
     max_grad_norm: float = 1.0

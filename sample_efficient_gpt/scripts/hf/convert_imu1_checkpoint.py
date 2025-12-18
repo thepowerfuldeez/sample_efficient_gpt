@@ -275,7 +275,7 @@ def _run_ref_logits(cfg_dict: dict[str, Any], state_dict: dict[str, torch.Tensor
     model.load_state_dict(state_dict, strict=True)
     model.eval()
     with torch.no_grad():
-        logits, _ = model(tokens)
+        logits, *_ = model(tokens)
     return logits
 
 

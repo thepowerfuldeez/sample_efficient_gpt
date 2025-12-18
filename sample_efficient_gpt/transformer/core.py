@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.nn as nn
 from torch import Tensor
@@ -62,6 +63,12 @@ class RMSNorm(nn.Module):
         """
         x is an activation from residual stream
         """
+        impl = os.environ.get("SEGPT_RMSNORM_IMPL", "torch").lower()
+        if impl == "liger":
+            casting_mode = os.environ.get("SEGPT_RMSNORM_CASTING", "llama")
+            out = LigerRMSNormFunction.apply(x, self.gain, self.eps, 0.0, casting_mode, True, None)
+            return out * self.position_scale.to(dtype=out.dtype)
+
         in_dtype = x.dtype
         x = x.to(torch.float32)
         with torch.autocast("cuda", enabled=False):
@@ -86,8 +93,10 @@ class SwiGLU(nn.Module):
     def forward(self, x: Float[Tensor, "... d_model"]) -> Float[Tensor, "... d_model"]:
         projected: Float[Tensor, "... 2*d_ff"] = self.up(x)
         left, right = projected.chunk(2, dim=-1)
+        impl = os.environ.get("SEGPT_SWIGLU_IMPL", "torch").lower()
+        if impl == "liger":
+            return self.down(LigerSiLUMulFunction.apply(left, right))
         return self.down(torch.nn.functional.silu(left) * right)
-        # return self.down(LigerSiLUMulFunction.apply(left, right))
 
 
 def softmax(x: Tensor, dim: int = 0, temperature: float = 1.0) -> Tensor:
