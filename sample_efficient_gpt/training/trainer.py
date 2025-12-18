@@ -359,8 +359,16 @@ class Trainer:
                 raise ValueError("Loading optimizer state is not supported with expert-parallel MoE yet.")
             return load_optimizer(path, self.cfg, getattr(self.model, "module", self.model), self.optimizers)
         if self.using_expert_parallel and self.is_distributed:
-            shard_path = path.with_name(f"{path.stem}.rank{self.rank}{path.suffix}")
-            load_path = shard_path if shard_path.exists() else path
+            # Accept either an unsharded path (`1000.pt`) or a specific shard path (`1000.rank0.pt`).
+            # In both cases, remap to this process' shard.
+            import re
+
+            m = re.match(r"^(?P<base>.+)\\.rank(?P<r>\\d+)\\.pt$", path.name)
+            if m is not None:
+                load_path = path.with_name(f"{m.group('base')}.rank{self.rank}.pt")
+            else:
+                shard_path = path.with_name(f"{path.stem}.rank{self.rank}{path.suffix}")
+                load_path = shard_path if shard_path.exists() else path
             self.iteration, self.run_id = load_model_expert_parallel(
                 load_path,
                 self.cfg,
