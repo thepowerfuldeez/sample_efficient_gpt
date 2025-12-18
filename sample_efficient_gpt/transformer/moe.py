@@ -75,7 +75,9 @@ class TopKMoE(nn.Module):
             return torch.zeros((), device=router_probs.device, dtype=router_probs.dtype)
 
         importance = router_probs.mean(dim=0)  # [E], grad flows
-        load_counts = torch.bincount(expert_idx_flat.to(torch.int64), minlength=self.num_routed_experts).to(torch.float32)
+        load_counts = torch.bincount(expert_idx_flat.to(torch.int64), minlength=self.num_routed_experts).to(
+            torch.float32
+        )
         denom_f = float(max(int(denom), 1))
         load = load_counts / denom_f
         loss = (importance * load).sum() * float(self.num_routed_experts)
@@ -104,6 +106,20 @@ class TopKMoE(nn.Module):
             if self.gate_scale != 1.0:
                 gate = gate * self.gate_scale
             aux_loss = self._aux_loss(router_probs, expert_idx, denom=tokens)
+
+        if os.environ.get("SEGPT_LOG_MOE_STATS", "0") == "1":
+            with torch.no_grad():
+                counts = torch.bincount(expert_idx.to(torch.int64), minlength=self.num_experts).to(torch.float32)
+                denom = counts.sum().clamp_min(1.0)
+                p = counts / denom
+                ent = -(p * (p.clamp_min(1e-20).log())).sum()
+                ent_norm = ent / float(math.log(self.num_experts)) if self.num_experts > 1 else ent
+                self.last_stats = {
+                    "load_max_frac": p.max(),
+                    "load_ent_norm": ent_norm,
+                    "gate_mean": gate.mean().to(torch.float32),
+                    "logits_std": router_logits.float().std(),
+                }
 
             if self.capacity_factor == 0.0:
                 capacity = tokens
@@ -202,7 +218,9 @@ class TopKMoE(nn.Module):
         if os.environ.get("SEGPT_LOG_MOE_STATS", "0") != "1":
             return
         with torch.no_grad():
-            counts = torch.bincount(expert_idx_flat.to(torch.int64), minlength=self.num_routed_experts).to(torch.float32)
+            counts = torch.bincount(expert_idx_flat.to(torch.int64), minlength=self.num_routed_experts).to(
+                torch.float32
+            )
             denom = counts.sum().clamp_min(1.0)
             p = counts / denom
             ent = -(p * (p.clamp_min(1e-20).log())).sum()
