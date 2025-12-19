@@ -56,6 +56,10 @@ class ModelConfig:
     attn_gating: bool = False
     layernorm_scaling: bool = False
     # --- MoE (token-level, no expert-parallel) ---
+    # MoE implementation backend.
+    # - "native": this repo's TopKMoE (supports EP, fp8 experts via torchao)
+    # - "sonicmoe": Dao-AILab/sonic-moe (single-rank experts only; requires external install)
+    moe_backend: str = "native"
     # 0 disables MoE
     moe_num_experts: int = 0
     moe_top_k: int = 1

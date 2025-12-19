@@ -98,3 +98,6 @@ Useful perf toggles (environment variables):
 
 ### B200 quickstart
 - `docs/B200_QUICKSTART.md`
+
+### SonicMoE backend (optional)
+- `docs/SONICMOE.md`

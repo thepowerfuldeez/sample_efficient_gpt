@@ -1,0 +1,3 @@
+[submodule "ext/sonic-moe"]
+	path = ext/sonic-moe
+	url = git@github.com:Dao-AILab/sonic-moe.git

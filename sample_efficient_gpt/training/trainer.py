@@ -93,6 +93,7 @@ class Trainer:
             self.cfg = cfg
         self.using_sft = self.cfg.data.mode == "sft"
         self.using_expert_parallel = int(self.cfg.model.moe_expert_parallel_size) > 1
+        self.using_sonicmoe = str(getattr(self.cfg.model, "moe_backend", "native")).lower() == "sonicmoe"
         self.iteration = 0
         self.wandb = wandb
 
@@ -113,6 +114,7 @@ class Trainer:
             # always keep master weights in fp32
             dtype=torch.float32,
             weight_tying=self.cfg.model.weight_tying,
+            moe_backend=self.cfg.model.moe_backend,
             moe_num_experts=self.cfg.model.moe_num_experts,
             moe_top_k=self.cfg.model.moe_top_k,
             moe_capacity_factor=self.cfg.model.moe_capacity_factor,
@@ -251,11 +253,13 @@ class Trainer:
             self.model.eval()
             self.optimizers = None
 
-        # # Torch compile is brittle with dynamic all-to-all token dispatch in EP MoE (shapes change step-to-step).
-        # # In practice this can lead to excessive recompiles and/or hangs across ranks during validation.
-        # if self.using_expert_parallel and compile:
-        #     logger.warning("Disabling torch.compile because expert-parallel MoE is enabled.")
-        #     compile = False
+        # torch.compile is brittle with EP MoE (dynamic all-to-all) and often incompatible with custom MoE kernels.
+        if compile and self.using_expert_parallel:
+            logger.warning("Disabling torch.compile because expert-parallel MoE is enabled.")
+            compile = False
+        if compile and self.using_sonicmoe:
+            logger.warning("Disabling torch.compile because moe_backend='sonicmoe' is enabled.")
+            compile = False
 
         if self.cfg.optim.scheduler == "wsd" and self.cfg.optim.wsd_phase == "decay":
             self.start_decay_step = self.cfg.optim.wsd_decay_step or self.iteration

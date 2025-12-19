@@ -43,6 +43,7 @@ class Block(nn.Module):
         n_heads: int,
         d_ff: int,
         use_moe: bool = False,
+        moe_backend: str = "native",
         moe_num_experts: int = 0,
         moe_top_k: int = 1,
         moe_capacity_factor: float = 1.0,
@@ -81,22 +82,50 @@ class Block(nn.Module):
         )
         self.ln2 = RMSNorm(d_model, position=position, device=device, dtype=dtype)
         if use_moe and moe_num_experts > 0:
-            self.ffn = TopKMoE(
-                d_model=d_model,
-                d_ff=d_ff,
-                num_experts=moe_num_experts,
-                top_k=moe_top_k,
-                capacity_factor=moe_capacity_factor,
-                aux_loss_coef=moe_aux_loss_coef,
-                z_loss_coef=moe_z_loss_coef,
-                router_jitter=moe_router_jitter,
-                normalize_gates=moe_normalize_gates,
-                gate_scale=moe_gate_scale,
-                expert_parallel_size=moe_expert_parallel_size,
-                expert_precision=moe_expert_precision,
-                device=device,
-                dtype=dtype,
-            )
+            if moe_backend == "native":
+                self.ffn = TopKMoE(
+                    d_model=d_model,
+                    d_ff=d_ff,
+                    num_experts=moe_num_experts,
+                    top_k=moe_top_k,
+                    capacity_factor=moe_capacity_factor,
+                    aux_loss_coef=moe_aux_loss_coef,
+                    z_loss_coef=moe_z_loss_coef,
+                    router_jitter=moe_router_jitter,
+                    normalize_gates=moe_normalize_gates,
+                    gate_scale=moe_gate_scale,
+                    expert_parallel_size=moe_expert_parallel_size,
+                    expert_precision=moe_expert_precision,
+                    device=device,
+                    dtype=dtype,
+                )
+            elif moe_backend == "sonicmoe":
+                if moe_expert_parallel_size != 1:
+                    raise ValueError("moe_backend='sonicmoe' currently does not support expert parallelism.")
+                if moe_expert_precision.lower() != "bf16":
+                    raise ValueError("moe_backend='sonicmoe' currently requires moe_expert_precision='bf16'.")
+                if moe_z_loss_coef != 0.0:
+                    raise ValueError("moe_backend='sonicmoe' does not support moe_z_loss_coef (set it to 0).")
+                if moe_capacity_factor != 1.0:
+                    raise ValueError("moe_backend='sonicmoe' does not support moe_capacity_factor (set it to 1).")
+                if not moe_normalize_gates:
+                    raise ValueError("moe_backend='sonicmoe' does not support moe_normalize_gates=False.")
+                if moe_gate_scale != 1.0:
+                    raise ValueError("moe_backend='sonicmoe' does not support moe_gate_scale (set it to 1).")
+
+                from sample_efficient_gpt.transformer.sonic_moe import SonicMoEAdapter
+
+                self.ffn = SonicMoEAdapter(
+                    d_model=d_model,
+                    d_ff=d_ff,
+                    num_experts=moe_num_experts,
+                    top_k=moe_top_k,
+                    aux_loss_coef=moe_aux_loss_coef,
+                    device=device,
+                    dtype=dtype,
+                )
+            else:
+                raise ValueError(f"Unknown moe_backend: {moe_backend!r}")
             self._ffn_is_moe = True
         else:
             self.ffn = SwiGLU(d_model, d_ff, device=device, dtype=dtype)
@@ -146,6 +175,7 @@ class Transformer(nn.Module):
         dtype=None,
         weight_tying: bool = False,
         num_grad_checkpoint_layers: int = 15,
+        moe_backend: str = "native",
         moe_num_experts: int = 0,
         moe_top_k: int = 1,
         moe_capacity_factor: float = 1.0,
@@ -165,6 +195,7 @@ class Transformer(nn.Module):
         self.n_layers = n_layers
         # do activation checkpointing for first N layers
         self.num_grad_checkpoint_layers = num_grad_checkpoint_layers
+        self.moe_backend = str(moe_backend)
         self.moe_num_experts = int(moe_num_experts)
         self.moe_top_k = int(moe_top_k)
         self.moe_capacity_factor = float(moe_capacity_factor)
@@ -197,6 +228,7 @@ class Transformer(nn.Module):
                     n_heads,
                     d_ff,
                     use_moe=use_moe_for_layer(pos - 1),
+                    moe_backend=self.moe_backend,
                     moe_num_experts=self.moe_num_experts,
                     moe_top_k=self.moe_top_k,
                     moe_capacity_factor=self.moe_capacity_factor,
@@ -272,6 +304,8 @@ class Transformer(nn.Module):
         Call after moving the model to CUDA and before initializing the optimizer / DDP buckets.
         """
         if self.moe_num_experts <= 0:
+            return
+        if self.moe_backend != "native":
             return
         if self.moe_expert_precision.lower() != "fp8":
             return
