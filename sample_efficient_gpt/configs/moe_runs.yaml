@@ -47,8 +47,6 @@ model_small_moe: &model_small_moe
   moe_start_layer: 2
   moe_every_n_layers: 2
   moe_end_layer: null
-  moe_expert_parallel_size: 1
-  moe_expert_precision: bf16
 
 experiments:
   moe_smoke_1gpu:

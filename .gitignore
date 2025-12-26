@@ -17,6 +17,8 @@ node_modules/
 **/rustbpe/target
 *.egg-info*
 **/data_tokenized
+data*
+evals/
 wandb/
 checkpoints/
 !experiments/**
