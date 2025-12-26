@@ -28,7 +28,10 @@ def normuon_update(p, v, second_momentum_buffer, eff_lr, eff_weight_decay, beta2
 
     v_update = v if v.dtype == p.dtype else v.to(dtype=p.dtype)
     p.add_(other=v_update, alpha=-eff_lr)
-    return v_norm.squeeze()
+    v_norm = v_norm.squeeze()
+    if v_norm.ndim > 0:
+        v_norm = v_norm.mean()
+    return v_norm
 
 
 class Muon(torch.optim.Optimizer):
