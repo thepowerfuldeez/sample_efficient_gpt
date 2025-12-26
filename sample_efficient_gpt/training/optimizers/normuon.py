@@ -96,7 +96,7 @@ class Muon(torch.optim.Optimizer):
                     state["second_momentum_buffer"] = (
                         torch.zeros_like(grad[..., 0:1], dtype=torch.float32)
                         if p.size(-2) >= p.size(-1)
-                        else torch.zeros_like(grad[0:1, ...], dtype=torch.float32)
+                        else torch.zeros_like(grad[..., 0:1, :], dtype=torch.float32)
                     )
                 momentum_buffer = state["momentum_buffer"]
                 second_momentum_buffer = state["second_momentum_buffer"]
