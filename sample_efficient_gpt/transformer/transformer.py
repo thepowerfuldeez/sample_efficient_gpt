@@ -6,8 +6,6 @@ from torch.utils.checkpoint import checkpoint
 from jaxtyping import Float, Int
 from tqdm.auto import tqdm
 
-import torch.distributed as dist
-
 from sample_efficient_gpt.transformer.core import SwiGLU, RMSNorm, Embedding, Linear, softmax
 from sample_efficient_gpt.transformer.attention import MultiHeadSelfAttention, KVCache
 from sample_efficient_gpt.transformer.moe import TopKMoE
@@ -45,6 +43,7 @@ class Block(nn.Module):
         use_moe: bool = False,
         moe_backend: str = "native",
         moe_num_experts: int = 0,
+        moe_num_shared_experts: int = 0,
         moe_top_k: int = 1,
         moe_capacity_factor: float = 1.0,
         moe_aux_loss_coef: float = 0.01,
@@ -52,8 +51,6 @@ class Block(nn.Module):
         moe_router_jitter: float = 0.0,
         moe_normalize_gates: bool = True,
         moe_gate_scale: float = 1.0,
-        moe_expert_parallel_size: int = 1,
-        moe_expert_precision: str = "bf16",
         attn_qknorm: bool = False,
         attn_val_residual: bool = False,
         attn_gating: bool = False,
@@ -90,20 +87,14 @@ class Block(nn.Module):
                     top_k=moe_top_k,
                     capacity_factor=moe_capacity_factor,
                     aux_loss_coef=moe_aux_loss_coef,
-                    z_loss_coef=moe_z_loss_coef,
                     router_jitter=moe_router_jitter,
                     normalize_gates=moe_normalize_gates,
                     gate_scale=moe_gate_scale,
-                    expert_parallel_size=moe_expert_parallel_size,
-                    expert_precision=moe_expert_precision,
+                    num_shared_experts=moe_num_shared_experts,
                     device=device,
                     dtype=dtype,
                 )
             elif moe_backend == "sonicmoe":
-                if moe_expert_parallel_size != 1:
-                    raise ValueError("moe_backend='sonicmoe' currently does not support expert parallelism.")
-                if moe_expert_precision.lower() != "bf16":
-                    raise ValueError("moe_backend='sonicmoe' currently requires moe_expert_precision='bf16'.")
                 if moe_z_loss_coef != 0.0:
                     raise ValueError("moe_backend='sonicmoe' does not support moe_z_loss_coef (set it to 0).")
                 if moe_capacity_factor != 1.0:
@@ -121,6 +112,7 @@ class Block(nn.Module):
                     num_experts=moe_num_experts,
                     top_k=moe_top_k,
                     aux_loss_coef=moe_aux_loss_coef,
+                    num_shared_experts=moe_num_shared_experts,
                     device=device,
                     dtype=dtype,
                 )
@@ -177,6 +169,7 @@ class Transformer(nn.Module):
         num_grad_checkpoint_layers: int = 15,
         moe_backend: str = "native",
         moe_num_experts: int = 0,
+        moe_num_shared_experts: int = 0,
         moe_top_k: int = 1,
         moe_capacity_factor: float = 1.0,
         moe_aux_loss_coef: float = 0.01,
@@ -184,8 +177,6 @@ class Transformer(nn.Module):
         moe_router_jitter: float = 0.0,
         moe_normalize_gates: bool = True,
         moe_gate_scale: float = 1.0,
-        moe_expert_parallel_size: int = 1,
-        moe_expert_precision: str = "bf16",
         moe_start_layer: int = 0,
         moe_every_n_layers: int = 1,
         moe_end_layer: int | None = None,
@@ -197,6 +188,7 @@ class Transformer(nn.Module):
         self.num_grad_checkpoint_layers = num_grad_checkpoint_layers
         self.moe_backend = str(moe_backend)
         self.moe_num_experts = int(moe_num_experts)
+        self.moe_num_shared_experts = int(moe_num_shared_experts)
         self.moe_top_k = int(moe_top_k)
         self.moe_capacity_factor = float(moe_capacity_factor)
         self.moe_aux_loss_coef = float(moe_aux_loss_coef)
@@ -204,8 +196,6 @@ class Transformer(nn.Module):
         self.moe_router_jitter = float(moe_router_jitter)
         self.moe_normalize_gates = bool(moe_normalize_gates)
         self.moe_gate_scale = float(moe_gate_scale)
-        self.moe_expert_parallel_size = int(moe_expert_parallel_size)
-        self.moe_expert_precision = str(moe_expert_precision)
         self.moe_start_layer = int(moe_start_layer)
         self.moe_every_n_layers = int(moe_every_n_layers)
         self.moe_end_layer = int(moe_end_layer) if moe_end_layer is not None else None
@@ -230,6 +220,7 @@ class Transformer(nn.Module):
                     use_moe=use_moe_for_layer(pos - 1),
                     moe_backend=self.moe_backend,
                     moe_num_experts=self.moe_num_experts,
+                    moe_num_shared_experts=self.moe_num_shared_experts,
                     moe_top_k=self.moe_top_k,
                     moe_capacity_factor=self.moe_capacity_factor,
                     moe_aux_loss_coef=self.moe_aux_loss_coef,
@@ -237,8 +228,6 @@ class Transformer(nn.Module):
                     moe_router_jitter=self.moe_router_jitter,
                     moe_normalize_gates=self.moe_normalize_gates,
                     moe_gate_scale=self.moe_gate_scale,
-                    moe_expert_parallel_size=self.moe_expert_parallel_size,
-                    moe_expert_precision=self.moe_expert_precision,
                     theta=theta,
                     attn_qknorm=attn_qknorm,
                     attn_val_residual=attn_val_residual,
@@ -269,14 +258,7 @@ class Transformer(nn.Module):
         v1 = None
         for i, layer in enumerate(self.blocks):
             with nvtx_range(f"block {i}"):
-                # EP MoE uses all-to-all collectives in forward; avoid activation checkpointing for those blocks
-                # (checkpoint would re-run collectives during backward, increasing overhead and risking hangs).
-                is_ep_moe = bool(
-                    getattr(layer, "_ffn_is_moe", False)
-                    and isinstance(getattr(layer, "ffn", None), TopKMoE)
-                    and getattr(layer.ffn, "_ep_enabled", False)
-                )
-                if i < self.num_grad_checkpoint_layers and not is_ep_moe:
+                if i < self.num_grad_checkpoint_layers:
                     # checkpoint this block
                     def layer_forward(x, v1, kv_cache, _layer=layer):
                         # IMPORTANT: bind `layer` as a default arg to avoid late-binding bugs during recomputation.
@@ -296,22 +278,6 @@ class Transformer(nn.Module):
             moe_aux_loss = moe_aux_loss + moe_aux
         x = self.final_norm(x)
         return self.lm_head(x), avg_kurtosis_values, moe_aux_loss
-
-    def maybe_convert_moe_experts_to_fp8(self) -> None:
-        """
-        Convert only MoE expert matmuls to float8 (best-effort).
-
-        Call after moving the model to CUDA and before initializing the optimizer / DDP buckets.
-        """
-        if self.moe_num_experts <= 0:
-            return
-        if self.moe_backend != "native":
-            return
-        if self.moe_expert_precision.lower() != "fp8":
-            return
-        for m in self.modules():
-            if isinstance(m, TopKMoE):
-                m.convert_experts_to_fp8()
 
     def generate(
         self,
