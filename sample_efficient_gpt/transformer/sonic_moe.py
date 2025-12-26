@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.nn as nn
 from torch import Tensor
@@ -89,6 +90,8 @@ class SonicMoEAdapter(nn.Module):
 
         self._use_fake = not torch.cuda.is_available()
         self._moe_dtype = torch.float16 if not self._use_fake else (dtype or torch.float32)
+        self.act_scale = float(os.environ.get("SEGPT_SONICMOE_ACT_SCALE", "0.5"))
+        self.act_clamp = float(os.environ.get("SEGPT_SONICMOE_ACT_CLAMP", "20.0"))
         shared_dtype = self._moe_dtype if not self._use_fake else dtype
         self.shared_experts = nn.ModuleList(
             [SwiGLU(d_model, d_ff, device=device, dtype=shared_dtype) for _ in range(self.num_shared_experts)]
@@ -139,7 +142,10 @@ class SonicMoEAdapter(nn.Module):
 
         b, s, d = x.shape
         with torch.autocast("cuda", enabled=False):
-            x_moe = x if x.dtype == self._moe_dtype else x.to(self._moe_dtype)
+            x_moe = x * self.act_scale if self.act_scale != 1.0 else x
+            if self.act_clamp > 0.0:
+                x_moe = x_moe.clamp(min=-self.act_clamp, max=self.act_clamp)
+            x_moe = x_moe if x_moe.dtype == self._moe_dtype else x_moe.to(self._moe_dtype)
             shared_out = None
             if self.num_shared_experts > 0:
                 shared_out = torch.zeros_like(x_moe)
