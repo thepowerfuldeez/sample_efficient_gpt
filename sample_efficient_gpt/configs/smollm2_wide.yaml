@@ -29,11 +29,11 @@ optim_base: &optim_base
 
 data_mix: &data_mix
   tokenizer_path: HuggingFaceTB/SmolLM2-135M
-  validation_path: /home/george/sample_efficient_gpt/sample_efficient_gpt/data_smollm2_imu/val.npy
-  train_path: 1215_data_mix.json
-  context_length: 704
-  batch_size: 60
-  val_batch_size: 12
+  validation_path: /home/george/datasets/val.npy
+  train_path: /home/george/sample_efficient_gpt/1226_stable.json
+  context_length: 768
+  batch_size: 1024
+  val_batch_size: 32
 
 base_experiment: &base_experiment
   model: *model_main
@@ -47,16 +47,16 @@ experiments:
     trainer:
       <<: *trainer_base
       run_name: "{date}_smollm_imu_stable"
-      gradient_accumulation_steps: 8
-      max_steps: 1000000
-      save_every: 5000
+      gradient_accumulation_steps: 1
+      max_steps: 100000
+      save_every: 2500
       # load_from: /mnt/harddrive/checkpoints/1215_smollm_conversion/smollm2_imu_wide2x_gqa_extras_qknormrms_g8.pt
-      load_from: /mnt/harddrive/checkpoints/1216_smollm_imu_stable/260000.pt
+      load_from: /home/george/checkpoints/smollm_wider.pt
     optim:
       <<: *optim_base
       muon_lr: 1.1e-2
-      zero_lr_steps: 1000
-      warmup_steps: 5000
+      zero_lr_steps: 500
+      warmup_steps: 2500
     data:
       <<: *data_mix
 
