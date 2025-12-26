@@ -17,7 +17,6 @@ from transformers import PreTrainedTokenizerFast
 from sample_efficient_gpt.transformer import Transformer
 from sample_efficient_gpt.training import (
     load_model,
-    load_model_expert_parallel,
     load_optimizer,
     save_checkpoint,
     MemoryMappedDataset,
@@ -91,8 +90,16 @@ class Trainer:
         else:
             logger.info("Loading from config")
             self.cfg = cfg
+        if int(getattr(self.cfg.model, "moe_num_experts", 0)) > 0:
+            if str(getattr(self.cfg.model, "moe_backend", "native")).lower() != "sonicmoe":
+                logger.info("Overriding moe_backend to 'sonicmoe' for MoE runs.")
+            self.cfg.model.moe_backend = "sonicmoe"
+            self.cfg.model.moe_z_loss_coef = 0.0
+            self.cfg.model.moe_capacity_factor = 1.0
+            self.cfg.model.moe_normalize_gates = True
+            self.cfg.model.moe_gate_scale = 1.0
+
         self.using_sft = self.cfg.data.mode == "sft"
-        self.using_expert_parallel = int(self.cfg.model.moe_expert_parallel_size) > 1
         self.using_sonicmoe = str(getattr(self.cfg.model, "moe_backend", "native")).lower() == "sonicmoe"
         self.iteration = 0
         self.wandb = wandb
@@ -123,8 +130,7 @@ class Trainer:
             moe_router_jitter=self.cfg.model.moe_router_jitter,
             moe_normalize_gates=self.cfg.model.moe_normalize_gates,
             moe_gate_scale=self.cfg.model.moe_gate_scale,
-            moe_expert_parallel_size=self.cfg.model.moe_expert_parallel_size,
-            moe_expert_precision=self.cfg.model.moe_expert_precision,
+            moe_num_shared_experts=self.cfg.model.moe_num_shared_experts,
             moe_start_layer=self.cfg.model.moe_start_layer,
             moe_every_n_layers=self.cfg.model.moe_every_n_layers,
             moe_end_layer=self.cfg.model.moe_end_layer,
@@ -135,13 +141,8 @@ class Trainer:
             load_from = Path(load_from)
             self.load_state(load_from, model_only=True)
 
-        # If requested, convert only MoE experts to float8 before DDP/optimizer init.
-        # Doing this lazily during forward can break optimizer parameter references.
-        if hasattr(self.model, "maybe_convert_moe_experts_to_fp8"):
-            self.model.maybe_convert_moe_experts_to_fp8()
-
         # maximum achievable is 90% for bf16; 80% for fp8
-        flops_multiplier = 0.9 if not (self.cfg.trainer.use_fp8 or self.cfg.model.moe_expert_precision == "fp8") else 1.6
+        flops_multiplier = 0.9 if not self.cfg.trainer.use_fp8 else 1.6
         if self.is_distributed:
             if self.cfg.trainer.dist_mode == "ddp":
                 self.model = DDP(self.model)
@@ -203,7 +204,7 @@ class Trainer:
 
         if load_components == "all":
             self._init_optimizers()
-            if load_from is not None and not self.using_expert_parallel:
+            if load_from is not None:
                 self.load_state(load_from, model_only=False, optimizers_only=True)
 
             logger.info(f"Model is created with hparams {self.cfg.model}")
@@ -253,10 +254,6 @@ class Trainer:
             self.model.eval()
             self.optimizers = None
 
-        # torch.compile is brittle with EP MoE (dynamic all-to-all) and often incompatible with custom MoE kernels.
-        if compile and self.using_expert_parallel:
-            logger.warning("Disabling torch.compile because expert-parallel MoE is enabled.")
-            compile = False
         if compile and self.using_sonicmoe:
             logger.warning("Disabling torch.compile because moe_backend='sonicmoe' is enabled.")
             compile = False
@@ -266,10 +263,6 @@ class Trainer:
             self.decay_steps = self.cfg.trainer.max_steps - self.start_decay_step
         else:
             self.decay_steps, self.start_decay_step = 0, 0
-        # if self.cfg.trainer.use_fp8:
-        #     convert_to_float8_training(self.model, config=config, module_filter_fn=module_filter_fn)
-        #     print("converted model to fp8:", self.model)
-
         if compile:
             self.model.compile()
 
@@ -361,39 +354,14 @@ class Trainer:
     def load_state(self, path: Path, model_only=True, optimizers_only=False):
         logger.info(f"Loading {model_only=} state from {str(path)}")
         if optimizers_only:
-            if self.using_expert_parallel:
-                raise ValueError("Loading optimizer state is not supported with expert-parallel MoE yet.")
             return load_optimizer(path, self.cfg, getattr(self.model, "module", self.model), self.optimizers)
-        if self.using_expert_parallel and self.is_distributed:
-            # Accept either an unsharded path (`1000.pt`) or a specific shard path (`1000.rank0.pt`).
-            # In both cases, remap to this process' shard.
-            import re
-
-            m = re.match(r"^(?P<base>.+)\\.rank(?P<r>\\d+)\\.pt$", path.name)
-            if m is not None:
-                load_path = path.with_name(f"{m.group('base')}.rank{self.rank}.pt")
-            else:
-                shard_path = path.with_name(f"{path.stem}.rank{self.rank}{path.suffix}")
-                load_path = shard_path if shard_path.exists() else path
-            self.iteration, self.run_id = load_model_expert_parallel(
-                load_path,
-                self.cfg,
-                getattr(self.model, "module", self.model),
-                rank=self.rank,
-                world_size=self.world_size,
-            )
-        else:
-            self.iteration, self.run_id = load_model(path, self.cfg, getattr(self.model, "module", self.model))
+        self.iteration, self.run_id = load_model(path, self.cfg, getattr(self.model, "module", self.model))
         logger.info(f"Restored {self.iteration} iteration")
         return self.iteration
 
     def save_state(self):
         logger.info(f"Saving training state at iter={self.iteration}")
-        shard_type = None
         fpath = self.save_dir / f"{self.iteration}.pt"
-        if self.using_expert_parallel and self.is_distributed:
-            shard_type = "expert_parallel"
-            fpath = self.save_dir / f"{self.iteration}.rank{self.rank}.pt"
         save_checkpoint(
             fpath,
             self.cfg,
@@ -403,7 +371,6 @@ class Trainer:
             run_id=self.wandb.id if self.wandb is not None else None,
             rank=self.rank if self.is_distributed else None,
             world_size=self.world_size if self.is_distributed else None,
-            shard_type=shard_type,
         )
 
     def log(self, data, rank_zero=True):
@@ -716,23 +683,13 @@ class Trainer:
         logger.info("Starting training loop")
         while self.iteration < self.cfg.trainer.max_steps:
             if self.iteration % self.cfg.trainer.save_every == 0:
-                if self.using_expert_parallel:
-                    # EP shards experts across ranks, so every rank must save its shard.
-                    self.save_state()
-                elif self.rank_zero_only:
+                if self.rank_zero_only:
                     self.save_state()
 
             run_eval = self.val_dataset is not None and not os.getenv("NO_VAL", "0") == "1"
             need_eval = run_eval and self.iteration > 0 and self.iteration % self.cfg.trainer.val_every == 0
             if need_eval:
-                if self.using_expert_parallel and self.is_distributed:
-                    # EP MoE forward uses collectives; all ranks must enter validation together.
-                    dist.barrier()
-                    val_metrics = self.validate()
-                    dist.barrier()
-                    if self.rank_zero_only:
-                        self.log(val_metrics)
-                elif self.rank_zero_only:
+                if self.rank_zero_only:
                     val_metrics = self.validate()
                     self.log(val_metrics)
 
@@ -789,9 +746,7 @@ class Trainer:
                     rank_zero=False,
                 )
             self.iteration += 1
-        if self.using_expert_parallel:
-            self.save_state()
-        elif self.rank_zero_only:
+        if self.rank_zero_only:
             self.save_state()
             if not os.getenv("NO_VAL", "0") == "1":
                 val_metrics = self.validate()

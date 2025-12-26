@@ -55,25 +55,22 @@ class ModelConfig:
     attn_val_residual: bool = False
     attn_gating: bool = False
     layernorm_scaling: bool = False
-    # --- MoE (token-level, no expert-parallel) ---
+    # --- MoE (token-level) ---
     # MoE implementation backend.
-    # - "native": this repo's TopKMoE (supports EP, fp8 experts via torchao)
+    # - "native": this repo's TopKMoE
     # - "sonicmoe": Dao-AILab/sonic-moe (single-rank experts only; requires external install)
     moe_backend: str = "native"
     # 0 disables MoE
     moe_num_experts: int = 0
+    moe_num_shared_experts: int = 0
     moe_top_k: int = 1
     moe_capacity_factor: float = 1.0
-    moe_aux_loss_coef: float = 0.01
+    moe_aux_loss_coef: float = 0.001
     moe_z_loss_coef: float = 0.0
     moe_router_jitter: float = 0.0
     moe_normalize_gates: bool = True
     # Scales router gates applied to expert outputs (e.g. 10.0 increases router/expert signal strength).
     moe_gate_scale: float = 1.0
-    # expert parallelism (currently supports moe_expert_parallel_size == world_size)
-    moe_expert_parallel_size: int = 1
-    # expert matmul precision mode (best-effort; may fall back depending on environment)
-    moe_expert_precision: str = "bf16"  # "bf16" or "fp8"
     # apply MoE to layers in [start, end) every N layers
     moe_start_layer: int = 0
     moe_every_n_layers: int = 1
