@@ -234,6 +234,190 @@ def _build_swiglu_up_weight(
     return out
 
 
+def _make_repeat_map(src_units: int, dst_units: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Returns:
+      old_idx: (dst_units,) long tensor mapping each new unit -> an old unit
+      counts:  (src_units,) long tensor with how many times each old unit is repeated
+    """
+    if src_units <= 0 or dst_units <= 0:
+        raise ValueError(f"Invalid units: src_units={src_units}, dst_units={dst_units}")
+    base = dst_units // src_units
+    rem = dst_units % src_units
+    counts = torch.full((src_units,), base, dtype=torch.long)
+    if rem:
+        counts[:rem] += 1
+    old_idx = torch.arange(src_units, dtype=torch.long).repeat_interleave(counts)
+    if old_idx.numel() != dst_units:
+        raise RuntimeError("Repeat map construction failed.")
+    return old_idx, counts
+
+
+def _build_swiglu_net2wider(
+    *,
+    gate: torch.Tensor,
+    up: torch.Tensor,
+    down: torch.Tensor,
+    src_hidden: int,
+    dst_hidden: int,
+    src_dff: int,
+    dst_dff: int,
+    init_up: torch.Tensor,
+    init_down: torch.Tensor,
+    init_multiplier: float,
+    mode: WideningMode,
+    down_noise_std: float,
+    rng: torch.Generator,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Net2Wider-style FFN widening on the intermediate dimension.
+    """
+    if dst_dff < src_dff:
+        raise ValueError("net2wider FFN expects dst_dff >= src_dff")
+
+    out_up = _init_tensor_like(init_up, init_multiplier=init_multiplier, mode=mode)
+    out_down = _init_tensor_like(init_down, init_multiplier=init_multiplier, mode=mode)
+
+    r_in = min(src_hidden, dst_hidden)
+    r_out = min(src_hidden, dst_hidden)
+
+    old_idx, counts = _make_repeat_map(src_dff, dst_dff)
+    denom = counts[old_idx].to(dtype=out_down.dtype)
+
+    out_up[:dst_dff, :r_in] = gate[old_idx, :r_in].to(out_up.dtype)
+    out_up[dst_dff : 2 * dst_dff, :r_in] = up[old_idx, :r_in].to(out_up.dtype)
+
+    down_src = down[:r_out, :src_dff].to(out_down.dtype)
+    down_new = down_src[:, old_idx] / denom.unsqueeze(0)
+
+    if down_noise_std > 0.0:
+        sigma = down_src.std(dim=0, unbiased=False)
+        pos = 0
+        for j in range(src_dff):
+            cnt = int(counts[j].item())
+            if cnt <= 1:
+                pos += cnt
+                continue
+            n = torch.randn((r_out, cnt), generator=rng, dtype=down_new.dtype)
+            n.mul_(float(down_noise_std) * sigma[j].to(down_new.dtype) / float(cnt))
+            n.sub_(n.mean(dim=1, keepdim=True))
+            down_new[:, pos : pos + cnt] += n
+            pos += cnt
+
+    out_down[:r_out, :dst_dff] = down_new
+    return out_up, out_down
+
+
+def _build_qkv_weight_net2wider_blockrepeat(
+    *,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    src_hidden: int,
+    dst_hidden: int,
+    src_heads: int,
+    dst_heads: int,
+    src_kv_heads: int,
+    dst_kv_heads: int,
+    head_dim: int,
+    init_qkv: torch.Tensor,
+    init_multiplier: float,
+    mode: WideningMode,
+) -> torch.Tensor:
+    """
+    Net2Wider attention widening for packed QKV via block repetition.
+    """
+    out = _init_tensor_like(init_qkv, init_multiplier=init_multiplier, mode=mode)
+    col_overlap = min(src_hidden, dst_hidden)
+
+    if dst_heads % src_heads != 0 or dst_kv_heads % src_kv_heads != 0:
+        raise ValueError("net2wider_blockrepeat requires integer head scaling for both Q and KV heads")
+    f_q = dst_heads // src_heads
+    f_kv = dst_kv_heads // src_kv_heads
+    if f_q != f_kv:
+        raise ValueError("net2wider_blockrepeat requires the same scale factor for heads and kv_heads")
+
+    for nh in range(dst_heads):
+        oh = nh % src_heads
+        dst_r = slice(nh * head_dim, (nh + 1) * head_dim)
+        src_r = slice(oh * head_dim, (oh + 1) * head_dim)
+        out[dst_r, :col_overlap] = q[src_r, :col_overlap].to(out.dtype)
+
+    dst_kv_out = dst_kv_heads * head_dim
+    src_kv_out = src_kv_heads * head_dim
+
+    k_row0 = dst_hidden
+    for nk in range(dst_kv_heads):
+        ok = nk % src_kv_heads
+        dst_r = slice(k_row0 + nk * head_dim, k_row0 + (nk + 1) * head_dim)
+        src_r = slice(ok * head_dim, (ok + 1) * head_dim)
+        out[dst_r, :col_overlap] = k[src_r, :col_overlap].to(out.dtype)
+
+    v_row0 = dst_hidden + dst_kv_out
+    for nk in range(dst_kv_heads):
+        ok = nk % src_kv_heads
+        dst_r = slice(v_row0 + nk * head_dim, v_row0 + (nk + 1) * head_dim)
+        src_r = slice(ok * head_dim, (ok + 1) * head_dim)
+        out[dst_r, :col_overlap] = v[src_r, :col_overlap].to(out.dtype)
+
+    return out
+
+
+def _build_attn_out_weight_net2wider_blockrepeat(
+    *,
+    o: torch.Tensor,
+    src_hidden: int,
+    dst_hidden: int,
+    src_heads: int,
+    dst_heads: int,
+    head_dim: int,
+    init_out: torch.Tensor,
+    init_multiplier: float,
+    mode: WideningMode,
+    out_noise_std: float,
+    rng: torch.Generator,
+) -> torch.Tensor:
+    """
+    Net2Wider for attention output projection via head block repetition.
+    """
+    out = _init_tensor_like(init_out, init_multiplier=init_multiplier, mode=mode)
+    row_overlap = min(src_hidden, dst_hidden)
+
+    if dst_heads % src_heads != 0:
+        raise ValueError("net2wider_blockrepeat requires integer head scaling")
+    f = dst_heads // src_heads
+
+    if f == 1:
+        r = min(src_hidden, dst_hidden)
+        c = min(src_hidden, dst_hidden)
+        out[:r, :c] = o[:r, :c].to(out.dtype)
+        return out
+
+    o_src = o[:row_overlap, :src_hidden].to(out.dtype)
+    sigma = o_src.std(dim=0, unbiased=False)
+
+    for oh in range(src_heads):
+        for j in range(head_dim):
+            old_col = oh * head_dim + j
+            base = o_src[:, old_col] / float(f)
+
+            for b in range(f):
+                nh = b * src_heads + oh
+                new_col = nh * head_dim + j
+                out[:row_overlap, new_col] = base
+
+            if out_noise_std > 0.0:
+                n = torch.randn((row_overlap, f), generator=rng, dtype=out.dtype)
+                n.mul_(float(out_noise_std) * sigma[old_col].to(out.dtype) / float(f))
+                n.sub_(n.mean(dim=1, keepdim=True))
+                for b in range(f):
+                    nh = b * src_heads + oh
+                    new_col = nh * head_dim + j
+                    out[:row_overlap, new_col] += n[:, b]
+
+    return out
+
+
 def _patch_cpu_safety() -> None:
     """
     Avoid unconditional CUDA side-effects at import time from some Triton modules.
@@ -264,6 +448,11 @@ def _convert(
     layernorm_scaling: bool,
     weight_tying: bool,
     qknorm_gain: float | None,
+    ffn_expand: str,
+    ffn_down_noise_std: float,
+    attn_expand: str,
+    attn_out_noise_std: float,
+    expand_seed: int,
 ) -> None:
     hf_cfg = AutoConfig.from_pretrained(hf_dir)
     hf_model = AutoModelForCausalLM.from_pretrained(hf_dir, dtype=torch.float32, device_map={"": "cpu"})
@@ -324,6 +513,9 @@ def _convert(
     )
     target.eval()
     out_sd: dict[str, torch.Tensor] = target.state_dict()
+
+    rng = torch.Generator(device="cpu")
+    rng.manual_seed(int(expand_seed))
 
     rmsnorm_gain_scale = (
         (src_hidden / width) ** 0.5 if (widening_mode in {"preserve", "preserve-norm"} and width != src_hidden) else 1.0
@@ -407,62 +599,122 @@ def _convert(
         if k_w.shape[0] != src_kv_out or v_w.shape[0] != src_kv_out:
             raise ValueError(f"Unexpected k/v out_features (expected {src_kv_out})")
 
-        dst_kv_out = int(n_kv_heads * (width // n_heads))
+        dst_head_dim = width // n_heads
+        dst_kv_out = int(n_kv_heads * dst_head_dim)
 
         qkv_key = f"{imu_prefix}.attn.qkv.linear.weight"
-        out_sd[qkv_key] = _build_qkv_weight(
-            q=q_w,
-            k=k_w,
-            v=v_w,
-            src_hidden=src_hidden,
-            dst_hidden=width,
-            src_kv_out=src_kv_out,
-            dst_kv_out=dst_kv_out,
-            init_qkv=out_sd[qkv_key],
-            init_multiplier=init_multiplier,
-            mode=widening_mode,
-        )
+        if attn_expand == "net2wider":
+            if dst_head_dim != src_head_dim:
+                raise ValueError("attn_expand=net2wider requires matching head_dim")
+            if (n_heads % src_heads) != 0 or (n_kv_heads % src_kv_heads) != 0:
+                raise ValueError("attn_expand=net2wider requires integer scaling of heads and kv_heads")
+            if (n_heads // src_heads) != (n_kv_heads // src_kv_heads):
+                raise ValueError("attn_expand=net2wider requires the same scale factor for heads and kv_heads")
 
-        if widening_mode == "preserve":
-            out_w = _init_tensor_like(
-                out_sd[f"{imu_prefix}.attn.out.linear.weight"], init_multiplier=init_multiplier, mode=widening_mode
+            out_sd[qkv_key] = _build_qkv_weight_net2wider_blockrepeat(
+                q=q_w,
+                k=k_w,
+                v=v_w,
+                src_hidden=src_hidden,
+                dst_hidden=width,
+                src_heads=src_heads,
+                dst_heads=n_heads,
+                src_kv_heads=src_kv_heads,
+                dst_kv_heads=n_kv_heads,
+                head_dim=src_head_dim,
+                init_qkv=out_sd[qkv_key],
+                init_multiplier=init_multiplier,
+                mode=widening_mode,
             )
-            _copy_overlap_2d(out_w, hf_sd[f"{hf_prefix}.self_attn.o_proj.weight"])
-            out_sd[f"{imu_prefix}.attn.out.linear.weight"] = out_w
+
+            out_sd[f"{imu_prefix}.attn.out.linear.weight"] = _build_attn_out_weight_net2wider_blockrepeat(
+                o=hf_sd[f"{hf_prefix}.self_attn.o_proj.weight"],
+                src_hidden=src_hidden,
+                dst_hidden=width,
+                src_heads=src_heads,
+                dst_heads=n_heads,
+                head_dim=src_head_dim,
+                init_out=out_sd[f"{imu_prefix}.attn.out.linear.weight"],
+                init_multiplier=init_multiplier,
+                mode=widening_mode,
+                out_noise_std=float(attn_out_noise_std),
+                rng=rng,
+            )
         else:
-            out_sd[f"{imu_prefix}.attn.out.linear.weight"] = _scale_and_copy_like(
-                out_sd[f"{imu_prefix}.attn.out.linear.weight"],
-                hf_sd[f"{hf_prefix}.self_attn.o_proj.weight"],
-                init_multiplier,
+            out_sd[qkv_key] = _build_qkv_weight(
+                q=q_w,
+                k=k_w,
+                v=v_w,
+                src_hidden=src_hidden,
+                dst_hidden=width,
+                src_kv_out=src_kv_out,
+                dst_kv_out=dst_kv_out,
+                init_qkv=out_sd[qkv_key],
+                init_multiplier=init_multiplier,
+                mode=widening_mode,
             )
+
+            if widening_mode == "preserve":
+                out_w = _init_tensor_like(
+                    out_sd[f"{imu_prefix}.attn.out.linear.weight"], init_multiplier=init_multiplier, mode=widening_mode
+                )
+                _copy_overlap_2d(out_w, hf_sd[f"{hf_prefix}.self_attn.o_proj.weight"])
+                out_sd[f"{imu_prefix}.attn.out.linear.weight"] = out_w
+            else:
+                out_sd[f"{imu_prefix}.attn.out.linear.weight"] = _scale_and_copy_like(
+                    out_sd[f"{imu_prefix}.attn.out.linear.weight"],
+                    hf_sd[f"{hf_prefix}.self_attn.o_proj.weight"],
+                    init_multiplier,
+                )
 
         gate_w = hf_sd[f"{hf_prefix}.mlp.gate_proj.weight"]
         up_w = hf_sd[f"{hf_prefix}.mlp.up_proj.weight"]
-        src_dff = gate_w.shape[0]
-        out_sd[f"{imu_prefix}.ffn.up.linear.weight"] = _build_swiglu_up_weight(
-            gate=gate_w,
-            up=up_w,
-            src_hidden=src_hidden,
-            dst_hidden=width,
-            src_dff=src_dff,
-            dst_dff=d_ff,
-            init_up=out_sd[f"{imu_prefix}.ffn.up.linear.weight"],
-            init_multiplier=init_multiplier,
-            mode=widening_mode,
-        )
+        down_src = hf_sd[f"{hf_prefix}.mlp.down_proj.weight"]
 
-        if widening_mode == "preserve":
-            down_w = _init_tensor_like(
-                out_sd[f"{imu_prefix}.ffn.down.linear.weight"], init_multiplier=init_multiplier, mode=widening_mode
+        src_dff = gate_w.shape[0]
+        if ffn_expand == "net2wider" and d_ff >= src_dff:
+            up_new, down_new = _build_swiglu_net2wider(
+                gate=gate_w,
+                up=up_w,
+                down=down_src,
+                src_hidden=src_hidden,
+                dst_hidden=width,
+                src_dff=src_dff,
+                dst_dff=d_ff,
+                init_up=out_sd[f"{imu_prefix}.ffn.up.linear.weight"],
+                init_down=out_sd[f"{imu_prefix}.ffn.down.linear.weight"],
+                init_multiplier=init_multiplier,
+                mode=widening_mode,
+                down_noise_std=float(ffn_down_noise_std),
+                rng=rng,
             )
-            _copy_overlap_2d(down_w, hf_sd[f"{hf_prefix}.mlp.down_proj.weight"])
-            out_sd[f"{imu_prefix}.ffn.down.linear.weight"] = down_w
+            out_sd[f"{imu_prefix}.ffn.up.linear.weight"] = up_new
+            out_sd[f"{imu_prefix}.ffn.down.linear.weight"] = down_new
         else:
-            out_sd[f"{imu_prefix}.ffn.down.linear.weight"] = _scale_and_copy_like(
-                out_sd[f"{imu_prefix}.ffn.down.linear.weight"],
-                hf_sd[f"{hf_prefix}.mlp.down_proj.weight"],
-                init_multiplier,
+            out_sd[f"{imu_prefix}.ffn.up.linear.weight"] = _build_swiglu_up_weight(
+                gate=gate_w,
+                up=up_w,
+                src_hidden=src_hidden,
+                dst_hidden=width,
+                src_dff=src_dff,
+                dst_dff=d_ff,
+                init_up=out_sd[f"{imu_prefix}.ffn.up.linear.weight"],
+                init_multiplier=init_multiplier,
+                mode=widening_mode,
             )
+
+            if widening_mode == "preserve":
+                down_w = _init_tensor_like(
+                    out_sd[f"{imu_prefix}.ffn.down.linear.weight"], init_multiplier=init_multiplier, mode=widening_mode
+                )
+                _copy_overlap_2d(down_w, down_src)
+                out_sd[f"{imu_prefix}.ffn.down.linear.weight"] = down_w
+            else:
+                out_sd[f"{imu_prefix}.ffn.down.linear.weight"] = _scale_and_copy_like(
+                    out_sd[f"{imu_prefix}.ffn.down.linear.weight"],
+                    down_src,
+                    init_multiplier,
+                )
 
         # If gating is enabled, ensure the initial behavior is a no-op.
         # In attention.py we use `2*sigmoid(attn_gate(x))`, so zero weights => gate==1.
@@ -557,6 +809,52 @@ def main() -> None:
             "'preserve' zero-fills expanded regions and rescales RMSNorm gains so the widened model is function-preserving; "
             "'preserve-norm' keeps muP init but rescales RMSNorm gains (often restores eval parity when widening)."
         ),
+    )
+    p.add_argument(
+        "--ffn-expand",
+        type=str,
+        default="slice",
+        choices=["slice", "net2wider"],
+        help=(
+            "FFN widening behavior when dst d_ff > src d_ff. "
+            "'slice' keeps current behavior (copy overlap + init rest). "
+            "'net2wider' duplicates FFN neurons and splits Wdown to preserve function."
+        ),
+    )
+    p.add_argument(
+        "--ffn-down-noise-std",
+        type=float,
+        default=0.0,
+        help=(
+            "If --ffn-expand=net2wider, add zero-sum Gaussian noise to duplicated Wdown columns "
+            "(per original neuron group). This preserves the forward pass but breaks symmetry."
+        ),
+    )
+    p.add_argument(
+        "--attn-expand",
+        type=str,
+        default="slice",
+        choices=["slice", "net2wider"],
+        help=(
+            "Attention widening when dst heads > src heads (and head_dim matches). "
+            "'slice' keeps current behavior. "
+            "'net2wider' duplicates heads and splits Wo columns to preserve function."
+        ),
+    )
+    p.add_argument(
+        "--attn-out-noise-std",
+        type=float,
+        default=0.0,
+        help=(
+            "If --attn-expand=net2wider, add zero-sum Gaussian noise to duplicated Wo columns "
+            "(per original head-feature). Preserves forward pass but breaks symmetry."
+        ),
+    )
+    p.add_argument(
+        "--expand-seed",
+        type=int,
+        default=0,
+        help="RNG seed used for net2wider symmetry-breaking noise (converter-time only).",
     )
 
     # Target architecture controls (defaults: template values if provided, else from HF).
@@ -684,6 +982,11 @@ def main() -> None:
         layernorm_scaling=layernorm_scaling,
         weight_tying=weight_tying,
         qknorm_gain=args.qknorm_gain,
+        ffn_expand=args.ffn_expand,
+        ffn_down_noise_std=args.ffn_down_noise_std,
+        attn_expand=args.attn_expand,
+        attn_out_noise_std=args.attn_out_noise_std,
+        expand_seed=args.expand_seed,
     )
 
 
