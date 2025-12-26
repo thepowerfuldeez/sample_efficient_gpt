@@ -49,6 +49,7 @@ dependencies = [
     "setuptools-scm>=9.2.2",
     "hf-transfer>=0.1.9",
     "ipywidgets>=8.1.8",
+    "uv_build",
 ]
 
 [build-system]
@@ -64,25 +65,24 @@ package = true
 python-preference = "managed"
 index-strategy = "unsafe-best-match"
 no-build-isolation = true
-override-dependencies = ["torch==2.10.0.dev20251206+cu130", "torchvision==0.25.0.dev20251206+cu130"]
 
 [tool.uv.sources]
 torch = [
-  { index = "pytorch-cu130" },
+  { index = "pytorch-cu128" },
 ]
 torchvision = [
-  { index = "pytorch-cu130" },
+  { index = "pytorch-cu128" },
 ]
 torchao = [
-  { index = "pytorch-cu130" },
+  { index = "pytorch-cu128" },
 ]
 vllm = { path = "../vllm", editable = true }
 transformers = { path = "../transformers", editable = true }
 fastsplit = { path = "sample_efficient_gpt/fastsplit", editable = true }
 
 [[tool.uv.index]]
-name = "pytorch-cu130"
-url = "https://download.pytorch.org/whl/nightly/cu130"
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/nightly/cu128"
 
 [tool.pytest.ini_options]
 log_cli = true

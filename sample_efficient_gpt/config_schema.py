@@ -49,7 +49,6 @@ class ModelConfig:
     n_kv_heads: int | None = None
     vocab_size: int = 10_000
     theta: float = 10_000
-    rope_interleaved: bool = False
     weight_tying: bool = False
     attn_qknorm: bool = False
     attn_val_residual: bool = False
