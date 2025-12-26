@@ -112,7 +112,7 @@ experiments:
       warmup_steps: 1000
       wsd_need_warmup: true
       wsd_phase: stable
-      zero_lr_steps: 300
+      zero_lr_steps: 100
     data:
       tokenizer_path: HuggingFaceTB/SmolLM2-135M
       validation_path: /home/george/datasets/val.npy
