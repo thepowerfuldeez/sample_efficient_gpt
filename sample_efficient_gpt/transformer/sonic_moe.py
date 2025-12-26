@@ -108,6 +108,7 @@ class SonicMoEAdapter(nn.Module):
 
         try:
             from sonicmoe import KernelBackendMoE, MoE  # type: ignore[import-not-found]
+            from sonicmoe.enums import ActivationType
         except Exception as e:  # pragma: no cover
             raise RuntimeError(
                 "Failed to import `sonicmoe`.\n"
@@ -118,14 +119,15 @@ class SonicMoEAdapter(nn.Module):
             ) from e
 
         self._kernel_backend = KernelBackendMoE.sonicmoe
+
         moe = MoE(
             num_experts=int(self.num_routed_experts),
             num_experts_per_tok=int(top_k),
             hidden_size=int(d_model),
             intermediate_size=int(d_ff),
-            is_glu=True,
+            activation_function=ActivationType.SWIGLU,  # SwiGLU activation
             add_bias=bool(add_bias),
-            std=float(std),
+            std=float(std),  # Weight initialization std
         )
         if device is not None or self._moe_dtype is not None:
             moe = moe.to(device=device, dtype=self._moe_dtype)
