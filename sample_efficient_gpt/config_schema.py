@@ -40,7 +40,7 @@ class OptimConfig:
     wsd_decay_step: str | None = None  # current step if None
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=False)
 class ModelConfig:
     d_model: int = 1024
     d_ff: int = 4096

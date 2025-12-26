@@ -153,7 +153,8 @@ class Trainer:
                 self.available_flops = 749.5e12 * flops_multiplier
             # 8 B200 gpus each having 2pFLOPs bf16 compute
             elif self.world_size == 8:
-                self.available_flops = 2000e12 * flops_multiplier * self.world_size
+                # self.available_flops = 2000e12 * flops_multiplier * self.world_size
+                self.available_flops = 979e12 * flops_multiplier * self.world_size
             else:
                 # Best-effort fallback to avoid crashing on other world sizes.
                 self.available_flops = 209.5e12 * flops_multiplier * self.world_size
@@ -254,9 +255,9 @@ class Trainer:
             self.model.eval()
             self.optimizers = None
 
-        if compile and self.using_sonicmoe:
-            logger.warning("Disabling torch.compile because moe_backend='sonicmoe' is enabled.")
-            compile = False
+        # if compile and self.using_sonicmoe:
+        #     logger.warning("Disabling torch.compile because moe_backend='sonicmoe' is enabled.")
+        #     compile = False
 
         if self.cfg.optim.scheduler == "wsd" and self.cfg.optim.wsd_phase == "decay":
             self.start_decay_step = self.cfg.optim.wsd_decay_step or self.iteration

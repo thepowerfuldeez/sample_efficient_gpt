@@ -2,8 +2,8 @@ base: gpt_small_faster
 
 data_mix: &data_mix
   tokenizer_path: HuggingFaceTB/SmolLM2-135M
-  validation_path: /home/george/sample_efficient_gpt/sample_efficient_gpt/data_smollm2_imu/val.npy
-  train_path: 1215_data_mix.json
+  validation_path: /home/george/datasets/val.npy
+  train_path: 1226_stable.json
   context_length: 512
   batch_size: 8
   val_batch_size: 4
@@ -68,7 +68,7 @@ experiments:
       <<: *data_mix
       batch_size: 16
       
-  smollm2_moe48_ep_fp8_b200_8gpu:
+  smollm2_moe49:
     model:
       vocab_size: 49152
       d_model: 576
@@ -83,43 +83,40 @@ experiments:
       attn_gating: per-head
       attn_val_residual: true
       moe_gate_scale: 5.0
-      moe_num_experts: 48
+      moe_num_experts: 49
+      moe_num_shared_experts: 1
       moe_top_k: 1
       moe_capacity_factor: 1.00
-      moe_aux_loss_coef: 0.01
-      moe_z_loss_coef: 0.0001
-      moe_router_jitter: 0.01
-      moe_normalize_gates: true
-      moe_start_layer: 0
+      moe_aux_loss_coef: 0.001
+      moe_router_jitter: 0.001
+      moe_start_layer: 2
       moe_every_n_layers: 1
       moe_end_layer: 30
-      moe_expert_parallel_size: 8
-      moe_expert_precision: fp8
     trainer:
       dist_mode: ddp
-      save_dir: /root/checkpoints
-      run_name: "{date}_smollm2_moe48_ep_fp8_b200"
+      save_dir: /home/george/checkpoints
+      run_name: "{date}_smollm2_moe49"
       log_every: 50
       val_every: 1000
       save_every: 1000
       gradient_accumulation_steps: 1
       max_steps: 10000
       compile: true
-      # load_from: /root/smollm2_imu_moe48.pt
-      load_from: /root/checkpoints/1218_smollm2_moe48_ep_fp8_b200/1000.rank0.pt
+      load_from: /home/george/checkpoints/smollm_moe_49ep.pt
+      # load_from: /root/checkpoints/1218_smollm2_moe48_ep_fp8_b200/1000.rank0.pt
     optim:
       scheduler: wsd
       muon_wd: 0.1
-      muon_lr: 5.6e-3
-      lr: 2.8e-3
-      warmup_steps: 2000
+      muon_lr: 6e-3
+      lr: 4e-3
+      warmup_steps: 1000
       wsd_need_warmup: true
       wsd_phase: stable
-      zero_lr_steps: 100
+      zero_lr_steps: 300
     data:
       tokenizer_path: HuggingFaceTB/SmolLM2-135M
-      validation_path: /root/val.npy
-      train_path: /root/sample_efficient_gpt/sample_efficient_gpt/1215_data_mix.json
+      validation_path: /home/george/datasets/val.npy
+      train_path: /home/george/sample_efficient_gpt/sample_efficient_gpt/1226_stable.json
       context_length: 768
-      batch_size: 1536
+      batch_size: 768
       val_batch_size: 32
