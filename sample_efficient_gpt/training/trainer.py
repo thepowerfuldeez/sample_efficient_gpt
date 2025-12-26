@@ -171,7 +171,8 @@ class Trainer:
             named_params.append((n, p))
             unique_params.setdefault(id(p), p.numel())
 
-        self.total_params = int(sum(unique_params.values())) * self.world_size
+        self.total_params = int(sum(unique_params.values()))
+        self.total_params_all_ranks = int(self.total_params * self.world_size)
         embedding_params = int(getattr(getattr(model_for_count, "embedding", None), "weight", torch.empty(0)).numel())
         self.total_non_emb_params = int(self.total_params - embedding_params)
 
