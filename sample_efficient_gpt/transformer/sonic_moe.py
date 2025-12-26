@@ -87,11 +87,12 @@ class SonicMoEAdapter(nn.Module):
         if self.num_routed_experts <= 0:
             raise ValueError("num_routed_experts must be > 0")
 
-        self.shared_experts = nn.ModuleList(
-            [SwiGLU(d_model, d_ff, device=device, dtype=dtype) for _ in range(self.num_shared_experts)]
-        )
-
         self._use_fake = not torch.cuda.is_available()
+        self._moe_dtype = torch.float16 if not self._use_fake else (dtype or torch.float32)
+        shared_dtype = self._moe_dtype if not self._use_fake else dtype
+        self.shared_experts = nn.ModuleList(
+            [SwiGLU(d_model, d_ff, device=device, dtype=shared_dtype) for _ in range(self.num_shared_experts)]
+        )
         if self._use_fake:
             self._kernel_backend = None
             self.moe = _SonicMoEParams(
@@ -126,26 +127,31 @@ class SonicMoEAdapter(nn.Module):
             add_bias=bool(add_bias),
             std=float(std),
         )
-        if device is not None or dtype is not None:
-            moe = moe.to(device=device, dtype=dtype)
+        if device is not None or self._moe_dtype is not None:
+            moe = moe.to(device=device, dtype=self._moe_dtype)
         self.moe = moe
 
     def forward(self, x: Tensor) -> tuple[Tensor, Tensor]:
         if self._use_fake:
             raise RuntimeError("SonicMoEAdapter forward requires CUDA.")
 
-        shared_out = None
-        if self.num_shared_experts > 0:
-            shared_out = torch.zeros_like(x)
-            for expert in self.shared_experts:
-                shared_out = shared_out + expert(x)
-            if self.num_shared_experts > 1:
-                shared_out = shared_out / float(self.num_shared_experts)
-
         b, s, d = x.shape
-        y, aux = self.moe(x.reshape(b * s, d), kernel_backend_moe=self._kernel_backend)
-        y = y.reshape(b, s, d)
-        if shared_out is not None:
-            y = y + shared_out
+        with torch.autocast("cuda", enabled=False):
+            x_moe = x if x.dtype == self._moe_dtype else x.to(self._moe_dtype)
+            shared_out = None
+            if self.num_shared_experts > 0:
+                shared_out = torch.zeros_like(x_moe)
+                for expert in self.shared_experts:
+                    shared_out = shared_out + expert(x_moe)
+                if self.num_shared_experts > 1:
+                    shared_out = shared_out / float(self.num_shared_experts)
+
+            y, aux = self.moe(x_moe.reshape(b * s, d), kernel_backend_moe=self._kernel_backend)
+            y = y.reshape(b, s, d)
+            if shared_out is not None:
+                y = y + shared_out
+
+        if y.dtype != x.dtype:
+            y = y.to(dtype=x.dtype)
         aux = aux * self.aux_loss_coef
         return y, aux.to(dtype=x.dtype)
