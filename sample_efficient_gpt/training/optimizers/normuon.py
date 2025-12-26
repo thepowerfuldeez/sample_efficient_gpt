@@ -26,7 +26,8 @@ def normuon_update(p, v, second_momentum_buffer, eff_lr, eff_weight_decay, beta2
     cautious_mask = torch.eq(torch.signbit(v), torch.signbit(p))
     p.addcmul_(p, cautious_mask.to(p.dtype), value=-eff_weight_decay)
 
-    p.add_(other=v, alpha=-eff_lr)
+    v_update = v if v.dtype == p.dtype else v.to(dtype=p.dtype)
+    p.add_(other=v_update, alpha=-eff_lr)
     return v_norm.squeeze()
 
 
@@ -93,9 +94,9 @@ class Muon(torch.optim.Optimizer):
                 if len(state) == 0:
                     state["momentum_buffer"] = torch.zeros_like(grad)
                     state["second_momentum_buffer"] = (
-                        torch.zeros_like(grad[..., 0:1])
+                        torch.zeros_like(grad[..., 0:1], dtype=torch.float32)
                         if p.size(-2) >= p.size(-1)
-                        else torch.zeros_like(grad[0:1, ...])
+                        else torch.zeros_like(grad[0:1, ...], dtype=torch.float32)
                     )
                 momentum_buffer = state["momentum_buffer"]
                 second_momentum_buffer = state["second_momentum_buffer"]
