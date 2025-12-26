@@ -316,7 +316,6 @@ def _convert(
         attn_gating=attn_gating,
         layernorm_scaling=layernorm_scaling,
         theta=theta,
-        rope_interleaved=bool((template_cfg or {}).get("model", {}).get("rope_interleaved", False)),
         device="cpu",
         dtype=torch.float32,
         weight_tying=weight_tying,
