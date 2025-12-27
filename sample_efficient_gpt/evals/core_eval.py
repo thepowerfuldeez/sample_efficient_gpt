@@ -96,9 +96,49 @@ def stack_sequences(tokens, pad_token_id):
     return input_ids
 
 
+def _get_bos_token_id(tokenizer):
+    if hasattr(tokenizer, "get_bos_token_id"):
+        try:
+            bos_id = tokenizer.get_bos_token_id()
+        except TypeError:
+            bos_id = None
+        if bos_id is not None:
+            return bos_id
+    bos_id = getattr(tokenizer, "bos_token_id", None)
+    if bos_id is not None:
+        return bos_id
+    eos_id = getattr(tokenizer, "eos_token_id", None)
+    if eos_id is not None:
+        return eos_id
+    added_tokens = getattr(tokenizer, "added_tokens_decoder", None)
+    if added_tokens:
+        return next(iter(added_tokens), None)
+    return None
+
+
+def _encode_prompts(tokenizer, prompts):
+    encoding = tokenizer(prompts, add_special_tokens=False)
+    if hasattr(encoding, "input_ids"):
+        input_ids = encoding.input_ids
+    elif isinstance(encoding, dict) and "input_ids" in encoding:
+        input_ids = encoding["input_ids"]
+    else:
+        input_ids = encoding
+    if isinstance(prompts, str):
+        return [input_ids]
+    return input_ids
+
+
+def _maybe_prepend_bos(tokenizer, token_sequences):
+    bos_id = _get_bos_token_id(tokenizer)
+    if bos_id is None:
+        return token_sequences
+    return [[bos_id] + seq for seq in token_sequences]
+
+
 def batch_sequences_mc(tokenizer, prompts):
     # In multiple choice, contexts are the same but the continuation is different (common prefix)
-    tokens = tokenizer(prompts).input_ids
+    tokens = _maybe_prepend_bos(tokenizer, _encode_prompts(tokenizer, prompts))
     # figure out the start and end of each continuation
     answer_start_idx = find_common_length(tokens, direction="left")
     start_indices = [answer_start_idx] * len(prompts)
@@ -108,7 +148,7 @@ def batch_sequences_mc(tokenizer, prompts):
 
 def batch_sequences_schema(tokenizer, prompts):
     # In schema tasks, contexts vary but continuation is the same (common suffix)
-    tokens = tokenizer(prompts).input_ids
+    tokens = _maybe_prepend_bos(tokenizer, _encode_prompts(tokenizer, prompts))
     # figure out the start and end of each context
     suffix_length = find_common_length(tokens, direction="right")
     end_indices = [len(x) for x in tokens]
@@ -118,15 +158,9 @@ def batch_sequences_schema(tokenizer, prompts):
 
 def batch_sequences_lm(tokenizer, prompts):
     # In LM tasks, we have two prompts: without and with continuation
-    
-    # tokens = tokenizer(prompts).input_ids
-    # tokens_without, tokens_with = tokens
-    
-    # UPD for SuperBPE
-    tokens_without = tokenizer(prompts[0]).input_ids
-    tokens_cont = tokenizer(prompts[1][len(prompts[0]):]).input_ids
-    tokens_with = tokens_without + tokens_cont
-    
+    tokens = _maybe_prepend_bos(tokenizer, _encode_prompts(tokenizer, prompts))
+    tokens_without, tokens_with = tokens
+
     start_idx, end_idx = len(tokens_without), len(tokens_with)
     assert start_idx < end_idx, "prompt without is supposed to be a prefix of prompt with"
     assert tokens_without == tokens_with[:start_idx], "prompt without is supposed to be a prefix of prompt with"
@@ -211,8 +245,11 @@ def evaluate_example(idx, model, tokenizer, data, device, task_meta):
         tokens, start_idxs, end_idxs = new_tokens, new_start_idxs, new_end_idxs
 
     # Stack up all the sequences into a batch
-    eos_token_id = list(tokenizer.added_tokens_decoder)[0]
-    pad_token_id = eos_token_id
+    pad_token_id = getattr(tokenizer, "pad_token_id", None)
+    if pad_token_id is None:
+        pad_token_id = _get_bos_token_id(tokenizer)
+    if pad_token_id is None:
+        pad_token_id = 0
     input_ids = stack_sequences(tokens, pad_token_id)
     input_ids = input_ids.to(device)
 
