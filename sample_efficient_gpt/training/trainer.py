@@ -106,7 +106,6 @@ class Trainer:
             attn_gating=self.cfg.model.attn_gating,
             layernorm_scaling=self.cfg.model.layernorm_scaling,
             theta=self.cfg.model.theta,
-            rope_interleaved=self.cfg.model.rope_interleaved,
             device="cpu",
             # always keep master weights in fp32
             dtype=torch.float32,
@@ -127,9 +126,9 @@ class Trainer:
             # 749.5TFLOPS of compute in bf16 when using 4 gpus
             if self.world_size == 4:
                 self.available_flops = 749.5e12 * flops_multiplier
-            # 8 B200 gpus each having 2pFLOPs bf16 compute
+            # 8 H200 gpus each having 2pFLOPs bf16 compute
             elif self.world_size == 8:
-                self.available_flops = 2000e12 * flops_multiplier * self.world_size
+                self.available_flops = 989e12 * flops_multiplier * self.world_size
         else:
             # 209.5TFLOPS of compute in bf16 when using 1 gpu
             self.available_flops = 209.5e12 * flops_multiplier

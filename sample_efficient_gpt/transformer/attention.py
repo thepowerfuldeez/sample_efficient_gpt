@@ -119,7 +119,6 @@ class MultiHeadSelfAttention(nn.Module):
         qknorm: bool = False,
         value_residual: bool = False,
         gating: bool = False,
-        rope_interleaved: bool = False,
         device=None,
         dtype=None,
     ):
@@ -134,7 +133,6 @@ class MultiHeadSelfAttention(nn.Module):
             d_k=d_model // n_heads,
             max_seq_len=max_seq_len,
             device=device,
-            rope_interleaved=rope_interleaved,
         )
         head_dim = d_model // n_heads
         q_out = n_heads * head_dim

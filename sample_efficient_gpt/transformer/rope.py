@@ -25,9 +25,8 @@ def get_cos_sin(
 
 
 class RotatyPositionalEmbedding(nn.Module):
-    def __init__(self, theta: float, d_k: int, max_seq_len: int, device=None, rope_interleaved: bool = False):
+    def __init__(self, theta: float, d_k: int, max_seq_len: int, device=None):
         super().__init__()
-        self.rope_interleaved = rope_interleaved
         # time.monotonic()
         cos, sin = get_cos_sin(max_seq_len, theta, d_k, device)
         self.register_buffer("cos", cos, persistent=False)
@@ -47,20 +46,9 @@ class RotatyPositionalEmbedding(nn.Module):
             cos: Float[Tensor, "seq_len d_k // 2"] = self.cos[: x.size(-2)]
             sin: Float[Tensor, "seq_len d_k // 2"] = self.sin[: x.size(-2)]
 
-        # Two common RoPE layouts:
-        # - interleaved (pairs (0,1), (2,3), ...): current default in this repo
         # - split-half (pairs (0,d/2), (1,d/2+1), ...): used by LLaMA (rope_interleaved=false)
 
         x_f = x.to(torch.float32)
-        if self.rope_interleaved:
-            x_pairs = rearrange(x_f, "... seq_len (d_k_half t) -> ... seq_len d_k_half t", t=2)
-            x1, x2 = x_pairs[..., 0], x_pairs[..., 1]
-            row1 = x1 * cos - x2 * sin
-            row2 = x1 * sin + x2 * cos
-            rotated = torch.stack([row1, row2], dim=-1)
-            rotated = rearrange(rotated, "... seq_len d_k_half t -> ... seq_len (d_k_half t)", t=2)
-            return rotated.to(in_dtype)
-
         half = x_f.size(-1) // 2
         x1, x2 = x_f[..., :half], x_f[..., half:]
         row1 = x1 * cos - x2 * sin

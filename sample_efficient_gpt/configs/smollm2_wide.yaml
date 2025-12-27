@@ -14,7 +14,7 @@ model_main: &model_main
 
 trainer_base: &trainer_base
   dist_mode: ddp
-  save_dir: /mnt/harddrive/checkpoints
+  save_dir: /home/george/checkpoints
   val_every: 5000
   run_name: "{date}_main_run_mix"
 
@@ -30,9 +30,9 @@ optim_base: &optim_base
 data_mix: &data_mix
   tokenizer_path: HuggingFaceTB/SmolLM2-135M
   validation_path: /home/george/datasets/val.npy
-  train_path: /home/george/sample_efficient_gpt/1226_stable.json
+  train_path: /home/george/sample_efficient_gpt/sample_efficient_gpt/1226_stable.json
   context_length: 768
-  batch_size: 1024
+  batch_size: 384
   val_batch_size: 32
 
 base_experiment: &base_experiment
@@ -46,12 +46,12 @@ experiments:
     <<: *base_experiment
     trainer:
       <<: *trainer_base
-      run_name: "{date}_smollm_imu_stable"
-      gradient_accumulation_steps: 1
+      run_name: "{date}_smollm_imu_stable2"
+      gradient_accumulation_steps: 2
       max_steps: 100000
       save_every: 2500
       # load_from: /mnt/harddrive/checkpoints/1215_smollm_conversion/smollm2_imu_wide2x_gqa_extras_qknormrms_g8.pt
-      load_from: /home/george/checkpoints/smollm_wider.pt
+      load_from: /home/george/checkpoints/smollm_wider2.pt
     optim:
       <<: *optim_base
       muon_lr: 1.1e-2

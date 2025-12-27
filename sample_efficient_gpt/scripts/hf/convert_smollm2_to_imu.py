@@ -743,7 +743,6 @@ def _convert(
             "n_heads": n_heads,
             "n_kv_heads": n_kv_heads,
             "theta": theta,
-            "rope_interleaved": bool(template_model.get("rope_interleaved", False)),
             "weight_tying": weight_tying,
             "attn_qknorm": attn_qknorm,
             "attn_val_residual": attn_val_residual,
