@@ -60,29 +60,51 @@ experiments:
     data:
       <<: *data_mix
 
-  main_run_mix_decay:
+  decay:
     <<: *base_experiment
     trainer:
       <<: *trainer_base
-      run_name: "{date}_main_run_mix_decay"
-      gradient_accumulation_steps: 8
-      max_steps: 1950000
-      save_every: 5000
-      load_from: /mnt/harddrive/checkpoints/1115_main_run_mix_decay/1450000.pt
-      # load_from: /mnt/harddrive/checkpoints/1113_main_run_mix/1300000.pt
+      run_name: "{date}_smollm_imu_decay"
+      gradient_accumulation_steps: 2
+      max_steps: 200000
+      save_every: 2500
+      load_from: /home/george/checkpoints/1226_smollm_imu_stable2/100000.pt
     optim:
       <<: *optim_base
-      lr_min_coeff: 0.1
-      muon_lr: 1.22e-2
+      lr_min_coeff: 0.25
+      muon_lr: 1.15e-2
       wsd_need_warmup: false
       wsd_phase: decay
-      wsd_decay_step: 1300000
+      wsd_decay_step: 100000
     data:
-      tokenizer_path: tokenizer/trained_tokenizers/mix_bpe_hf
-      validation_path: /home/george/sample_efficient_gpt/sample_efficient_gpt/data_dclm_edu/tokenized_65536/val.npy
-      train_path: 1207_data_mix_stage2.json
-      context_length: 1088
-      batch_size: 52
+      <<: *data_mix
+      train_path: /home/george/sample_efficient_gpt/sample_efficient_gpt/1227_decay.json
+      context_length: 896
+      batch_size: 312
+      seed: 43
+
+  midtrain:
+    <<: *base_experiment
+    trainer:
+      <<: *trainer_base
+      run_name: "{date}_smollm_imu_midtrain"
+      gradient_accumulation_steps: 2
+      max_steps: 265000
+      save_every: 2500
+      load_from: /home/george/checkpoints/1227_smollm_imu_decay/200000.pt
+    optim:
+      <<: *optim_base
+      lr_min_coeff: 0.33
+      muon_lr: 0.003
+      lr: 0.002
+      wsd_need_warmup: false
+      wsd_phase: decay
+      wsd_decay_step: 200000
+    data:
+      <<: *data_mix
+      train_path: /home/george/sample_efficient_gpt/sample_efficient_gpt/0101_midtrain.json
+      context_length: 1152
+      batch_size: 192
       val_batch_size: 8
       seed: 43
 
