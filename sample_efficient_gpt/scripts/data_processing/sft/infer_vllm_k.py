@@ -140,10 +140,12 @@ def main() -> None:
     tok = AutoTokenizer.from_pretrained(str(args.model_dir), local_files_only=True, trust_remote_code=False)
     chat_template = load_chat_template(args.model_dir)
 
-    eos_ids = [
-        tok.encode("<|endoftext|>")[0],
-        tok.encode("<|assistant_end|>")[0],
-    ]
+    eos_ids = []
+    if tok.eos_token_id is not None:
+        eos_ids.append(tok.eos_token_id)
+    if "<|assistant_end|>" in tok.get_vocab():
+        eos_ids.append(tok.convert_tokens_to_ids("<|assistant_end|>"))
+    eos_ids = list(dict.fromkeys(eos_ids))
 
     sampling_params = SamplingParams(
         n=args.k,

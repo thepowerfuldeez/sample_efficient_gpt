@@ -4,7 +4,6 @@ from argparse import ArgumentParser
 import torch
 from transformers import PreTrainedTokenizerFast
 
-from sample_efficient_gpt.tokenizer import Tokenizer
 from sample_efficient_gpt.training.trainer import Trainer
 from sample_efficient_gpt.utils.logger import logger
 
