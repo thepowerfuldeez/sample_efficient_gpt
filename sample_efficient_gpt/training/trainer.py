@@ -587,11 +587,12 @@ class Trainer:
         }
         ga_steps = max(1, int(self.cfg.trainer.gradient_accumulation_steps))
         is_accum_boundary = ((self.iteration + 1) % ga_steps) == 0
-        if self.is_distributed and is_accum_boundary:
-            for k in ["opt_0_update_ratio", "opt_1_update_ratio"]:
-                update_ratios = torch.zeros(self.world_size, device=step_stats[k].device, dtype=step_stats[k].dtype)
-                dist.all_gather_into_tensor(update_ratios, step_stats[k])
-                log_processed[k] = update_ratios.mean().item()
+        # if self.is_distributed and is_accum_boundary:
+        #     for k in ["opt_0_update_ratio", "opt_1_update_ratio"]:
+        #         update_ratios = torch.zeros(self.world_size, device=step_stats[k].device, dtype=step_stats[k].dtype)
+        #         dist.all_gather_into_tensor(update_ratios, step_stats[k])
+        #         log_processed[k] = update_ratios.mean().item()
+        
         # take any other key as it is
         return {
             **log_processed,

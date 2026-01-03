@@ -159,7 +159,7 @@ def _rename_key(name: str, layer_idx: int | None) -> str:
         return "model.embed_tokens.weight"
     if name == "final_norm.gain":
         return "model.norm.weight"
-    if name == "lm_head.linear.weight":
+    if name == "lm_head.linear.weight" or name == "lm_head.weight":
         return "lm_head.weight"
 
     if name.startswith("ln1.gain"):

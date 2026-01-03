@@ -143,9 +143,7 @@ def _copy_overlap_2d(out: torch.Tensor, src: torch.Tensor) -> None:
     out[:r, :c] = src[:r, :c].to(out.dtype)
 
 
-def _expand_gqa_kv_to_mha(
-    kv_weight: torch.Tensor, *, n_kv_heads: int, n_heads: int, head_dim: int
-) -> torch.Tensor:
+def _expand_gqa_kv_to_mha(kv_weight: torch.Tensor, *, n_kv_heads: int, n_heads: int, head_dim: int) -> torch.Tensor:
     """
     Legacy helper for expanding GQA KV weights into an MHA layout by repeating KV heads.
     Kept for reference; native GQA is now supported in sample_efficient_gpt, so the main
@@ -532,7 +530,9 @@ def _convert(
 
     if "lm_head.weight" in hf_sd:
         if widening_mode == "preserve":
-            head = _init_tensor_like(out_sd["lm_head.linear.weight"], init_multiplier=init_multiplier, mode=widening_mode)
+            head = _init_tensor_like(
+                out_sd["lm_head.linear.weight"], init_multiplier=init_multiplier, mode=widening_mode
+            )
             _copy_overlap_2d(head, hf_sd["lm_head.weight"])
             out_sd["lm_head.linear.weight"] = head
         else:
@@ -542,7 +542,9 @@ def _convert(
     else:
         # tie_word_embeddings sometimes removes lm_head from state dict; fall back to embeddings.
         if widening_mode == "preserve":
-            head = _init_tensor_like(out_sd["lm_head.linear.weight"], init_multiplier=init_multiplier, mode=widening_mode)
+            head = _init_tensor_like(
+                out_sd["lm_head.linear.weight"], init_multiplier=init_multiplier, mode=widening_mode
+            )
             _copy_overlap_2d(head, hf_sd["model.embed_tokens.weight"])
             out_sd["lm_head.linear.weight"] = head
         else:
@@ -556,7 +558,9 @@ def _convert(
         gain.mul_(float(rmsnorm_gain_scale))
         out_sd["final_norm.gain"] = gain
     else:
-        out_sd["final_norm.gain"] = _scale_and_copy_like(out_sd["final_norm.gain"], hf_sd["model.norm.weight"], init_multiplier)
+        out_sd["final_norm.gain"] = _scale_and_copy_like(
+            out_sd["final_norm.gain"], hf_sd["model.norm.weight"], init_multiplier
+        )
 
     # Per-layer conversion.
     for layer_idx in range(n_layers):
@@ -564,12 +568,16 @@ def _convert(
         imu_prefix = f"blocks.{layer_idx}"
 
         if widening_mode in {"preserve", "preserve-norm"}:
-            ln1 = _init_tensor_like(out_sd[f"{imu_prefix}.ln1.gain"], init_multiplier=init_multiplier, mode=widening_mode)
+            ln1 = _init_tensor_like(
+                out_sd[f"{imu_prefix}.ln1.gain"], init_multiplier=init_multiplier, mode=widening_mode
+            )
             _copy_overlap_1d(ln1, hf_sd[f"{hf_prefix}.input_layernorm.weight"])
             ln1.mul_(float(rmsnorm_gain_scale))
             out_sd[f"{imu_prefix}.ln1.gain"] = ln1
 
-            ln2 = _init_tensor_like(out_sd[f"{imu_prefix}.ln2.gain"], init_multiplier=init_multiplier, mode=widening_mode)
+            ln2 = _init_tensor_like(
+                out_sd[f"{imu_prefix}.ln2.gain"], init_multiplier=init_multiplier, mode=widening_mode
+            )
             _copy_overlap_1d(ln2, hf_sd[f"{hf_prefix}.post_attention_layernorm.weight"])
             ln2.mul_(float(rmsnorm_gain_scale))
             out_sd[f"{imu_prefix}.ln2.gain"] = ln2
@@ -774,8 +782,12 @@ def _convert(
 
 def main() -> None:
     p = argparse.ArgumentParser()
-    p.add_argument("--hf-dir", type=str, required=True, help="HF repo id or local path (e.g. HuggingFaceTB/SmolLM2-135M).")
-    p.add_argument("--output", type=Path, required=True, help="Output .pt checkpoint path (sample_efficient_gpt format).")
+    p.add_argument(
+        "--hf-dir", type=str, required=True, help="HF repo id or local path (e.g. HuggingFaceTB/SmolLM2-135M)."
+    )
+    p.add_argument(
+        "--output", type=Path, required=True, help="Output .pt checkpoint path (sample_efficient_gpt format)."
+    )
 
     p.add_argument(
         "--template-config",
@@ -927,7 +939,9 @@ def main() -> None:
     n_heads = _parse_from_sources_or_int(args.n_heads, hf_value=hf_heads, template_value=template_model.get("n_heads"))
     d_ff = _parse_from_sources_or_int(args.d_ff, hf_value=hf_dff, template_value=template_model.get("d_ff"))
     n_layers = _parse_from_hf_or_int(args.n_layers, hf_layers) if args.n_layers == "from-hf" else int(args.n_layers)
-    vocab_size = _parse_from_hf_or_int(args.vocab_size, hf_vocab) if args.vocab_size == "from-hf" else int(args.vocab_size)
+    vocab_size = (
+        _parse_from_hf_or_int(args.vocab_size, hf_vocab) if args.vocab_size == "from-hf" else int(args.vocab_size)
+    )
     theta = _parse_from_sources_or_float(args.theta, hf_value=hf_theta, template_value=template_model.get("theta"))
 
     if width % n_heads != 0:
