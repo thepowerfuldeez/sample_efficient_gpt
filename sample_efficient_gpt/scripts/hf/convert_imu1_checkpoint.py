@@ -72,8 +72,8 @@ def _patch_cpu_qknorm() -> None:
 
     def _cpu_forward(self, q, k, v, is_causal: bool = True, q_start: int = 0):
         qf, kf = q.float(), k.float()
-        alpha = torch.rsqrt(qf.pow(2).sum(dim=-1, keepdim=True) + 1e-8)
-        beta = torch.rsqrt(kf.pow(2).sum(dim=-1, keepdim=True) + 1e-8)
+        alpha = torch.rsqrt(qf.pow(2).mean(dim=-1, keepdim=True) + 1e-8)
+        beta = torch.rsqrt(kf.pow(2).mean(dim=-1, keepdim=True) + 1e-8)
         qn = qf * alpha
         kn = kf * beta
 
@@ -119,7 +119,11 @@ def _resolve_tokens(
     return bos_id, eos_id, pad_id
 
 
-def _build_config(cfg_dict: dict[str, Any], tokenizer_dir: Path | None):
+def _build_config(
+    cfg_dict: dict[str, Any],
+    tokenizer_dir: Path | None,
+    tie_word_embeddings: bool | None = None,
+):
     # Use the Transformers-side config so the converted checkpoint loads directly with HF APIs.
     from transformers.models.imu_1 import Imu1Config
 
@@ -128,6 +132,9 @@ def _build_config(cfg_dict: dict[str, Any], tokenizer_dir: Path | None):
     max_pos = max(8192, data_cfg.get("context_length", 0), model_cfg.get("max_seq_len", 0))
 
     bos_id, eos_id, pad_id = _resolve_tokens(tokenizer_dir)
+
+    if tie_word_embeddings is None:
+        tie_word_embeddings = model_cfg.get("weight_tying", False)
 
     config = Imu1Config(
         vocab_size=model_cfg["vocab_size"],
@@ -144,7 +151,7 @@ def _build_config(cfg_dict: dict[str, Any], tokenizer_dir: Path | None):
         attn_val_residual=model_cfg.get("attn_val_residual", True),
         attn_gating=model_cfg.get("attn_gating", False),
         layernorm_scaling=model_cfg.get("layernorm_scaling", False),
-        tie_word_embeddings=model_cfg.get("weight_tying", False),
+        tie_word_embeddings=tie_word_embeddings,
         pad_token_id=data_cfg.get("pad_token_id", pad_id),
         bos_token_id=bos_id,
         eos_token_id=eos_id,
@@ -160,6 +167,8 @@ def _rename_key(name: str, layer_idx: int | None) -> str:
     if name == "final_norm.gain":
         return "model.norm.weight"
     if name == "lm_head.linear.weight" or name == "lm_head.weight":
+        return "lm_head.weight"
+    if name == "lm_head.weight":
         return "lm_head.weight"
 
     if name.startswith("ln1.gain"):
@@ -189,7 +198,10 @@ def _rename_key(name: str, layer_idx: int | None) -> str:
 
 def _convert_state_dict(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     new_state_dict: dict[str, torch.Tensor] = {}
+    has_linear_head = "lm_head.linear.weight" in state_dict
     for name, tensor in state_dict.items():
+        if name == "lm_head.weight" and has_linear_head:
+            continue
         if name.startswith("blocks."):
             parts = name.split(".")
             layer_idx = int(parts[1])
@@ -242,8 +254,11 @@ def _reverse_convert_state_dict(
             reverse_sd["final_norm.gain"] = tensor
         elif name == "lm_head.weight":
             reverse_sd["lm_head.linear.weight"] = tensor
+            reverse_sd["lm_head.weight"] = tensor
         else:
             raise KeyError(f"Unhandled converted key: {name}")
+    if "embedding.weight" in reverse_sd and "lm_head.weight" in reverse_sd:
+        reverse_sd["lm_head.weight"] = reverse_sd["embedding.weight"]
     return reverse_sd
 
 
@@ -268,6 +283,7 @@ def _run_ref_logits(cfg_dict: dict[str, Any], state_dict: dict[str, torch.Tensor
         attn_gating=m_cfg.get("attn_gating", False),
         layernorm_scaling=m_cfg.get("layernorm_scaling", False),
         theta=m_cfg.get("theta", 10000),
+        n_kv_heads=m_cfg.get("n_kv_heads", m_cfg["n_heads"]),
         device="cpu",
         dtype=torch.float32,
         weight_tying=m_cfg.get("weight_tying", False),
@@ -310,7 +326,16 @@ def main():
     state_dict = ckpt["model"]
 
     converted_sd = _convert_state_dict(state_dict)
-    config = _build_config(cfg_dict, args.tokenizer_dir)
+
+    tie_override: bool | None = None
+    if cfg_dict.get("model", {}).get("weight_tying", False):
+        emb = state_dict.get("embedding.weight")
+        head = state_dict.get("lm_head.linear.weight")
+        if emb is not None and head is not None and not torch.equal(emb, head):
+            tie_override = False
+            print("[imu1] Warning: weight_tying=true but embeddings differ; disabling HF tie_word_embeddings.")
+
+    config = _build_config(cfg_dict, args.tokenizer_dir, tie_override)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     model = Imu1ForCausalLM(config)
